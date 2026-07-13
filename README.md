@@ -91,7 +91,7 @@ cp config.example.json config.json
 
 | 配置项 | 说明 |
 | --- | --- |
-| `email_provider` | 邮箱服务商：`duckmail`、`yyds`、`cloudflare` |
+| `email_provider` | 邮箱服务商：`duckmail`、`yyds`、`cloudflare`、`freemail` |
 | `register_count` | 本次目标注册数量 |
 | `proxy` | 代理地址，可留空 |
 | `enable_nsfw` | 注册后是否尝试开启 NSFW |
@@ -103,11 +103,16 @@ cp config.example.json config.json
 | `cloudflare_path_token` | Cloudflare token 路径；默认 `/api/token` |
 | `cloudflare_path_messages` | Cloudflare 收件列表路径；默认 `/api/mails` |
 | `defaultDomains` | Cloudflare 临时邮箱默认域名 |
+| `freemail_api_base` | freemail 临时邮箱 API 地址 |
+| `freemail_jwt` | freemail JWT Token（用于 API 认证） |
 | `grok2api_auto_add_local` | 是否写入本地 grok2api token 池 |
 | `grok2api_local_token_file` | 本地 grok2api token 文件路径 |
 | `grok2api_auto_add_remote` | 是否写入远端 grok2api |
 | `grok2api_remote_base` | 远端 grok2api 地址，可填站点根地址或 `/admin/api` 管理 API 地址 |
 | `grok2api_remote_app_key` | 远端 grok2api app key |
+| `cliproxyapi_auto_add` | 是否上传 SSO token 到 CLIProxyAPI |
+| `cliproxyapi_remote_base` | CLIProxyAPI 服务地址 |
+| `cliproxyapi_management_key` | CLIProxyAPI 管理密钥 |
 
 ### Cloudflare 临时邮箱匿名模式（默认）
 
@@ -181,6 +186,34 @@ python cf_mail_debug.py --api-base "https://你的-worker-api-域名" --auth-mod
 ```
 
 程序会优先尝试 `/tokens/add`，并兼容 `/admin/api/tokens/add`；旧版全量保存接口也会兼容 `/tokens` 和 `/admin/api/tokens`。
+
+### freemail 临时邮箱
+
+[freemail](https://github.com/idinging/freemail) 是基于 Cloudflare Workers + D1 的开源临时邮箱服务，支持自动提取验证码。
+
+```json
+{
+  "email_provider": "freemail",
+  "freemail_api_base": "https://你的-freemail-域名",
+  "freemail_jwt": "你的 JWT_TOKEN"
+}
+```
+
+认证方式：使用 freemail 环境变量中的 `JWT_TOKEN`，通过 `Authorization: Bearer` 头传递。
+
+### CLIProxyAPI 凭证上传
+
+注册成功后可将 SSO token 自动上传到 [CLIProxyAPI](https://github.com/router-for-me/CLIProxyAPI) 作为 xAI auth 文件：
+
+```json
+{
+  "cliproxyapi_auto_add": true,
+  "cliproxyapi_remote_base": "https://你的-cliproxyapi-地址",
+  "cliproxyapi_management_key": "你的 management key"
+}
+```
+
+上传格式为 JSON auth 文件，通过 `/v0/management/auth-files` 接口写入。
 
 `config.json` 包含个人配置和密钥，不要提交到 Git。
 

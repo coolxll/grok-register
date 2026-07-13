@@ -54,6 +54,8 @@ DEFAULT_CONFIG = {
     "cloudflare_path_accounts": "/api/new_address",
     "cloudflare_path_token": "/api/token",
     "cloudflare_path_messages": "/api/mails",
+    "freemail_api_base": "",
+    "freemail_jwt": "",
     "proxy": "http://127.0.0.1:7890",
     "enable_nsfw": True,
     "register_count": 1,
@@ -64,6 +66,9 @@ DEFAULT_CONFIG = {
     "grok2api_auto_add_remote": False,
     "grok2api_remote_base": "",
     "grok2api_remote_app_key": "",
+    "cliproxyapi_auto_add": False,
+    "cliproxyapi_remote_base": "",
+    "cliproxyapi_management_key": "",
 }
 
 config = DEFAULT_CONFIG.copy()
@@ -707,6 +712,257 @@ def add_token_to_grok2api_pools(raw_token, email="", log_callback=None):
                 log_callback(f"[Debug] 写入 grok2api 远端池失败: {exc}")
 
 
+def _sso_to_oauth_token(sso_cookie, log_callback=None):
+    """SSO cookie → OAuth token dict via Device Flow."""
+    import base64
+
+    CLIENT_ID = "b1a00492-073a-47ea-816f-4c329264a828"
+    OIDC_ISSUER = "https://auth.x.ai"
+    SCOPES = (
+        "openid profile email offline_access grok-cli:access "
+        "api:access conversations:read conversations:write"
+    )
+
+    proxies = get_proxies()
+
+    # Create session with SSO cookie
+    session = requests.Session()
+    if proxies:
+        session.proxies = proxies
+    session.cookies.set("sso", sso_cookie, domain=".x.ai")
+
+    # Verify SSO is valid
+    try:
+        r = session.get("https://accounts.x.ai/", impersonate="chrome120", timeout=15)
+        if "sign-in" in r.url or "sign-up" in r.url:
+            if log_callback:
+                log_callback("[Debug] SSO cookie 无效")
+            return None
+    except Exception as e:
+        if log_callback:
+            log_callback(f"[Debug] 验证 SSO 失败: {e}")
+        return None
+
+    # Request device code
+    try:
+        r = session.post(
+            f"{OIDC_ISSUER}/oauth2/device/code",
+            data={"client_id": CLIENT_ID, "scope": SCOPES},
+            headers={"Content-Type": "application/x-www-form-urlencoded"},
+            timeout=15,
+        )
+        dc = r.json()
+    except Exception as e:
+        if log_callback:
+            log_callback(f"[Debug] device/code 失败: {e}")
+        return None
+
+    # Verify device code
+    try:
+        session.get(dc["verification_uri_complete"], impersonate="chrome120", timeout=15)
+        r = session.post(
+            f"{OIDC_ISSUER}/oauth2/device/verify",
+            data={"user_code": dc["user_code"]},
+            headers={"Content-Type": "application/x-www-form-urlencoded"},
+            impersonate="chrome120",
+            timeout=15,
+            allow_redirects=True,
+        )
+        if "consent" not in r.url:
+            if log_callback:
+                log_callback(f"[Debug] verify 失败: {r.url}")
+            return None
+    except Exception as e:
+        if log_callback:
+            log_callback(f"[Debug] verify 异常: {e}")
+        return None
+
+    # Approve device
+    try:
+        r = session.post(
+            f"{OIDC_ISSUER}/oauth2/device/approve",
+            data={
+                "user_code": dc["user_code"],
+                "action": "allow",
+                "principal_type": "User",
+                "principal_id": "",
+            },
+            headers={"Content-Type": "application/x-www-form-urlencoded"},
+            impersonate="chrome120",
+            timeout=15,
+            allow_redirects=True,
+        )
+        if "done" not in r.url:
+            if log_callback:
+                log_callback(f"[Debug] approve 失败: {r.url}")
+            return None
+    except Exception as e:
+        if log_callback:
+            log_callback(f"[Debug] approve 异常: {e}")
+        return None
+
+    # Poll for token
+    interval = dc.get("interval", 5)
+    expires_in = dc.get("expires_in", 1800)
+    deadline = time.time() + min(expires_in, 45)
+
+    while time.time() < deadline:
+        time.sleep(interval)
+        try:
+            r = session.post(
+                f"{OIDC_ISSUER}/oauth2/token",
+                data={
+                    "grant_type": "urn:ietf:params:oauth:grant-type:device_code",
+                    "client_id": CLIENT_ID,
+                    "device_code": dc["device_code"],
+                },
+                headers={"Content-Type": "application/x-www-form-urlencoded"},
+                timeout=10,
+            )
+            if r.ok:
+                return r.json()
+            err = r.json()
+            error = err.get("error", "")
+            if error == "authorization_pending":
+                continue
+            if error == "slow_down":
+                interval += 5
+                continue
+            if log_callback:
+                log_callback(f"[Debug] token 错误: {error}")
+            return None
+        except Exception as e:
+            if log_callback:
+                log_callback(f"[Debug] token 异常: {e}")
+            time.sleep(2)
+            continue
+
+    if log_callback:
+        log_callback("[Debug] 轮询超时")
+    return None
+
+
+def _token_to_cpa_entry(token, email=""):
+    """OAuth token → CPA xAI auth entry."""
+    import base64
+
+    DEFAULT_BASE_URL = "https://cli-chat-proxy.grok.com/v1"
+    DEFAULT_TOKEN_ENDPOINT = "https://auth.x.ai/oauth2/token"
+    DEFAULT_REDIRECT_URI = "http://127.0.0.1:56121/callback"
+    DEFAULT_CLIENT_HEADERS = {
+        "x-grok-client-version": "0.2.93",
+        "x-xai-token-auth": "xai-grok-cli",
+        "x-authenticateresponse": "authenticate-response",
+        "x-grok-client-identifier": "grok-shell",
+        "User-Agent": "grok-shell/0.2.93 (linux; x86_64)",
+    }
+
+    def decode_jwt_payload(t):
+        try:
+            seg = t.split(".")[1]
+            seg += "=" * (-len(seg) % 4)
+            return json.loads(base64.urlsafe_b64decode(seg))
+        except Exception:
+            return {}
+
+    access = token.get("access_token") or token.get("key") or ""
+    refresh = token.get("refresh_token") or ""
+    payload = decode_jwt_payload(access)
+
+    sub = payload.get("sub") or payload.get("principal_id") or ""
+
+    if "exp" in payload:
+        exp_ts = float(payload["exp"])
+        expires_in = int(max(exp_ts - float(payload.get("iat", exp_ts - 21600)), 0))
+        expired = datetime.datetime.fromtimestamp(exp_ts, tz=datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+    else:
+        expires_in = int(token.get("expires_in") or 21600)
+        expired = datetime.datetime.fromtimestamp(time.time() + expires_in, tz=datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+    last_refresh = datetime.datetime.now(tz=datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+    entry = {
+        "type": "xai",
+        "auth_kind": "oauth",
+        "access_token": access,
+        "refresh_token": refresh,
+        "token_type": "Bearer",
+        "expires_in": int(expires_in),
+        "expired": expired,
+        "last_refresh": last_refresh,
+        "email": (email or "").strip(),
+        "sub": sub.strip(),
+        "base_url": DEFAULT_BASE_URL,
+        "token_endpoint": DEFAULT_TOKEN_ENDPOINT,
+        "redirect_uri": DEFAULT_REDIRECT_URI,
+        "disabled": False,
+        "headers": dict(DEFAULT_CLIENT_HEADERS),
+    }
+    if token.get("id_token"):
+        entry["id_token"] = token["id_token"].strip()
+    return entry
+
+
+def add_token_to_cliproxyapi(raw_token, email="", log_callback=None):
+    """将 SSO cookie 通过 Device Flow 换取 OAuth token 并上传到 CLIProxyAPI。"""
+    if not config.get("cliproxyapi_auto_add", False):
+        return False
+    base = str(config.get("cliproxyapi_remote_base", "") or "").strip().rstrip("/")
+    mgmt_key = str(config.get("cliproxyapi_management_key", "") or "").strip()
+    if not base:
+        if log_callback:
+            log_callback("[Debug] cliproxyapi_remote_base 未配置，跳过上传")
+        return False
+    if not mgmt_key:
+        if log_callback:
+            log_callback("[Debug] cliproxyapi_management_key 未配置，跳过上传")
+        return False
+
+    sso_cookie = _normalize_sso_token(raw_token)
+    if not sso_cookie:
+        return False
+
+    # SSO → OAuth token via Device Flow
+    if log_callback:
+        log_callback("[*] SSO → OAuth Device Flow...")
+    token = _sso_to_oauth_token(sso_cookie, log_callback=log_callback)
+    if not token:
+        if log_callback:
+            log_callback("[Debug] Device Flow 失败，跳过上传")
+        return False
+
+    # Convert to CPA format
+    auth_data = _token_to_cpa_entry(token, email=email)
+
+    # Generate filename
+    sub = auth_data.get("sub", "")
+    if email:
+        safe_email = re.sub(r"[^a-zA-Z0-9._-]", "_", email)
+        filename = f"xai-{safe_email}.json"
+    elif sub:
+        safe_sub = re.sub(r"[^a-zA-Z0-9._-]", "_", sub)
+        filename = f"xai-{safe_sub}.json"
+    else:
+        filename = f"xai-{int(time.time())}.json"
+
+    # Upload to CLIProxyAPI
+    url = f"{base}/v0/management/auth-files?name={urllib.parse.quote(filename)}"
+    headers = {
+        "Authorization": f"Bearer {mgmt_key}",
+        "Content-Type": "application/json",
+    }
+    try:
+        resp = http_post(url, json=auth_data, headers=headers)
+        resp.raise_for_status()
+        if log_callback:
+            log_callback(f"[+] 已上传到 CLIProxyAPI: {filename}")
+        return True
+    except Exception as exc:
+        if log_callback:
+            log_callback(f"[Debug] 上传到 CLIProxyAPI 失败: {exc}")
+        return False
+
+
 def apply_browser_proxy_option(options, proxy):
     if not proxy:
         return
@@ -1112,6 +1368,136 @@ def yyds_get_oai_code(
     raise Exception(f"YYDS 在 {timeout}s 内未收到验证码邮件")
 
 
+# ── freemail provider ──────────────────────────────────────────────────────
+
+def freemail_build_headers():
+    """构建 freemail API 请求头。"""
+    jwt = str(config.get("freemail_jwt", "") or "").strip()
+    headers = {"Content-Type": "application/json"}
+    if jwt:
+        headers["Authorization"] = f"Bearer {jwt}"
+    return headers
+
+
+def freemail_get_domains():
+    """获取 freemail 可用域名列表。"""
+    api_base = str(config.get("freemail_api_base", "") or "").rstrip("/")
+    if not api_base:
+        raise Exception("freemail_api_base 未配置")
+    url = f"{api_base}/api/domains"
+    resp = http_get(url, headers=freemail_build_headers())
+    resp.raise_for_status()
+    return resp.json()
+
+
+def freemail_generate(length=None, domain_index=None):
+    """随机生成 freemail 临时邮箱，返回 (email, None)。"""
+    api_base = str(config.get("freemail_api_base", "") or "").rstrip("/")
+    if not api_base:
+        raise Exception("freemail_api_base 未配置")
+    url = f"{api_base}/api/generate"
+    params = {}
+    if length is not None:
+        params["length"] = length
+    if domain_index is not None:
+        params["domainIndex"] = domain_index
+    resp = http_get(url, headers=freemail_build_headers(), params=params)
+    resp.raise_for_status()
+    data = resp.json()
+    email = data.get("email")
+    if not email:
+        raise Exception(f"freemail /api/generate 返回数据缺少 email: {data}")
+    return email, None
+
+
+def freemail_get_emails(address, limit=50):
+    """获取指定邮箱的邮件列表。"""
+    api_base = str(config.get("freemail_api_base", "") or "").rstrip("/")
+    if not api_base:
+        raise Exception("freemail_api_base 未配置")
+    url = f"{api_base}/api/emails"
+    params = {"mailbox": address, "limit": limit}
+    resp = http_get(url, headers=freemail_build_headers(), params=params)
+    resp.raise_for_status()
+    return resp.json()
+
+
+def freemail_get_email_detail(email_id):
+    """获取单封邮件详情。"""
+    api_base = str(config.get("freemail_api_base", "") or "").rstrip("/")
+    if not api_base:
+        raise Exception("freemail_api_base 未配置")
+    url = f"{api_base}/api/email/{email_id}"
+    resp = http_get(url, headers=freemail_build_headers())
+    resp.raise_for_status()
+    return resp.json()
+
+
+def freemail_get_oai_code(
+    dev_token,
+    email,
+    timeout=180,
+    poll_interval=3,
+    log_callback=None,
+    cancel_callback=None,
+    resend_callback=None,
+):
+    """轮询 freemail 收件箱获取验证码。"""
+    deadline = time.time() + timeout
+    seen_ids = set()
+    while time.time() < deadline:
+        raise_if_cancelled(cancel_callback)
+        try:
+            messages = freemail_get_emails(email)
+        except Exception as exc:
+            if log_callback:
+                log_callback(f"[Debug] freemail 拉取邮件列表失败: {exc}")
+            sleep_with_cancel(poll_interval, cancel_callback)
+            continue
+        if not isinstance(messages, list):
+            messages = []
+        for msg in messages:
+            msg_id = msg.get("id")
+            if not msg_id or msg_id in seen_ids:
+                continue
+            seen_ids.add(msg_id)
+            # freemail 自动提取 verification_code
+            code = msg.get("verification_code")
+            subject = msg.get("subject", "")
+            if code:
+                if log_callback:
+                    log_callback(f"[*] freemail 自动提取验证码: {code}")
+                return str(code)
+            # 回退：获取详情手动解析
+            try:
+                detail = freemail_get_email_detail(msg_id)
+            except Exception as exc:
+                if log_callback:
+                    log_callback(f"[Debug] freemail 获取邮件详情失败: {exc}")
+                continue
+            code = detail.get("verification_code")
+            if code:
+                if log_callback:
+                    log_callback(f"[*] freemail 从详情提取验证码: {code}")
+                return str(code)
+            # 最后回退：手动解析内容
+            parts = []
+            if detail.get("content"):
+                parts.append(detail["content"])
+            if detail.get("html_content"):
+                parts.append(re.sub(r"<[^>]+>", " ", detail["html_content"]))
+            combined = "\n".join(parts)
+            if log_callback:
+                log_callback(f"[Debug] freemail 收到邮件: {subject}")
+            code = extract_verification_code(combined, subject)
+            if code:
+                if log_callback:
+                    log_callback(f"[*] freemail 手动解析验证码: {code}")
+                return code
+        sleep_with_cancel(poll_interval, cancel_callback)
+    raise Exception(f"freemail 在 {timeout}s 内未收到验证码邮件")
+
+
 def generate_username(length=10):
     chars = string.ascii_lowercase + string.digits
     return "".join(secrets.choice(chars) for _ in range(length))
@@ -1167,6 +1553,11 @@ def get_email_and_token(api_key=None):
             if not token:
                 raise Exception("获取 Cloudflare 邮箱 token 失败")
             return address, token
+    if provider == "freemail":
+        api_base = str(config.get("freemail_api_base", "") or "").rstrip("/")
+        if not api_base:
+            raise Exception("freemail_api_base 未配置")
+        return freemail_generate()
     key = api_key or get_duckmail_api_key()
     domain = pick_domain(api_key=key)
     username = generate_username(10)
@@ -1201,6 +1592,16 @@ def get_oai_code(
         )
     if provider == "cloudflare":
         return cloudflare_get_oai_code(
+            dev_token,
+            email,
+            timeout=timeout,
+            poll_interval=poll_interval,
+            log_callback=log_callback,
+            cancel_callback=cancel_callback,
+            resend_callback=resend_callback,
+        )
+    if provider == "freemail":
+        return freemail_get_oai_code(
             dev_token,
             email,
             timeout=timeout,
@@ -1896,7 +2297,7 @@ def fill_email_and_submit(timeout=45, log_callback=None, cancel_callback=None):
     while time.time() < deadline:
         raise_if_cancelled(cancel_callback)
         filled = page.run_js(
-            """
+            r"""
 const email = arguments[0];
 function isVisible(node) {
     if (!node) return false;
@@ -2826,7 +3227,7 @@ class GrokRegisterGUI:
 
         add_label(0, 0, "邮箱服务商:")
         self.email_provider_var = tk.StringVar(value=config.get("email_provider", "duckmail"))
-        self.email_provider_combo = tk_option_menu(config_frame, self.email_provider_var, ["duckmail", "yyds", "cloudflare"], width=12)
+        self.email_provider_combo = tk_option_menu(config_frame, self.email_provider_var, ["duckmail", "yyds", "cloudflare", "freemail"], width=12)
         add_field(self.email_provider_combo, 0, 1, sticky=tk.W)
 
         add_label(0, 2, "注册数量:")
@@ -2925,6 +3326,31 @@ class GrokRegisterGUI:
         self.grok2api_remote_key_entry = tk_entry(config_frame, textvariable=self.grok2api_remote_key_var, width=72)
         add_field(self.grok2api_remote_key_entry, 9, 1, columnspan=3)
 
+        add_label(10, 0, "freemail API Base:")
+        self.freemail_api_base_var = tk.StringVar(value=str(config.get("freemail_api_base", "")))
+        self.freemail_api_base_entry = tk_entry(config_frame, textvariable=self.freemail_api_base_var, width=72)
+        add_field(self.freemail_api_base_entry, 10, 1, columnspan=3)
+
+        add_label(11, 0, "freemail JWT:")
+        self.freemail_jwt_var = tk.StringVar(value=str(config.get("freemail_jwt", "")))
+        self.freemail_jwt_entry = tk_entry(config_frame, textvariable=self.freemail_jwt_var, width=72)
+        add_field(self.freemail_jwt_entry, 11, 1, columnspan=3)
+
+        add_label(12, 0, "CLIProxyAPI 上传:")
+        self.cliproxyapi_auto_var = tk.BooleanVar(value=bool(config.get("cliproxyapi_auto_add", False)))
+        self.cliproxyapi_auto_check = tk_checkbutton(config_frame, variable=self.cliproxyapi_auto_var)
+        add_field(self.cliproxyapi_auto_check, 12, 1, sticky=tk.W)
+
+        add_label(13, 0, "CLIProxyAPI Base:")
+        self.cliproxyapi_base_var = tk.StringVar(value=str(config.get("cliproxyapi_remote_base", "")))
+        self.cliproxyapi_base_entry = tk_entry(config_frame, textvariable=self.cliproxyapi_base_var, width=72)
+        add_field(self.cliproxyapi_base_entry, 13, 1, columnspan=3)
+
+        add_label(14, 0, "CLIProxyAPI Key:")
+        self.cliproxyapi_key_var = tk.StringVar(value=str(config.get("cliproxyapi_management_key", "")))
+        self.cliproxyapi_key_entry = tk_entry(config_frame, textvariable=self.cliproxyapi_key_var, width=72)
+        add_field(self.cliproxyapi_key_entry, 14, 1, columnspan=3)
+
         btn_frame = tk.Frame(main_frame, bg=UI_BG)
         btn_frame.grid(row=1, column=0, sticky=tk.EW, pady=(0, 6))
         self.start_btn = tk_button(btn_frame, text="开始注册", command=self.start_registration)
@@ -3014,6 +3440,11 @@ class GrokRegisterGUI:
         config["grok2api_auto_add_remote"] = bool(self.grok2api_remote_auto_var.get())
         config["grok2api_remote_base"] = self.grok2api_remote_base_var.get().strip()
         config["grok2api_remote_app_key"] = self.grok2api_remote_key_var.get().strip()
+        config["freemail_api_base"] = self.freemail_api_base_var.get().strip()
+        config["freemail_jwt"] = self.freemail_jwt_var.get().strip()
+        config["cliproxyapi_auto_add"] = bool(self.cliproxyapi_auto_var.get())
+        config["cliproxyapi_remote_base"] = self.cliproxyapi_base_var.get().strip()
+        config["cliproxyapi_management_key"] = self.cliproxyapi_key_var.get().strip()
         raw_paths = [x.strip() for x in self.cloudflare_paths_var.get().split(",") if x.strip()]
         if len(raw_paths) >= 4:
             config["cloudflare_path_domains"] = raw_paths[0] if raw_paths[0].startswith("/") else ("/" + raw_paths[0])
@@ -3023,6 +3454,9 @@ class GrokRegisterGUI:
         save_config()
         if config["email_provider"] == "cloudflare" and not config["cloudflare_api_base"]:
             self.log("[!] Cloudflare 模式需要先填写 Cloudflare API Base")
+            return
+        if config["email_provider"] == "freemail" and not config["freemail_api_base"]:
+            self.log("[!] freemail 模式需要先填写 freemail API Base")
             return
         try:
             count = int(self.count_var.get())
@@ -3138,6 +3572,7 @@ class GrokRegisterGUI:
                     except Exception as file_exc:
                         self.log(f"[Debug] 保存账号文件失败: {file_exc}")
                     add_token_to_grok2api_pools(sso, email=email, log_callback=self.log)
+                    add_token_to_cliproxyapi(sso, email=email, log_callback=self.log)
                     self.success_count += 1
                     retry_count_for_slot = 0
                     i += 1
@@ -3298,6 +3733,7 @@ def run_registration_cli(count):
                 except Exception as file_exc:
                     cli_log(f"[Debug] 保存账号文件失败: {file_exc}")
                 add_token_to_grok2api_pools(sso, email=email, log_callback=cli_log)
+                add_token_to_cliproxyapi(sso, email=email, log_callback=cli_log)
                 success_count += 1
                 retry_count_for_slot = 0
                 i += 1
