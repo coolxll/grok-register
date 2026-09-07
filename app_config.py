@@ -19,6 +19,10 @@ DEFAULT_CONFIG = {
     "cloudmail_public_token": "",
     "cloudmail_domains": "",
     "cloudmail_path_messages": "/api/public/emailList",
+    "freemail_api_base": "",
+    "freemail_jwt": "",
+    "mailtm_api_base": "https://api.mail.tm",
+    "gptmail_url": "https://mail.chatgpt.org.uk/",
     "proxy_mode": "auto",
     "proxy": "",
     "proxy_fallback": "none",
@@ -70,6 +74,9 @@ DEFAULT_CONFIG = {
     "cpa_mint_cookie_inject": True,
     "cpa_oidc_request_timeout_sec": 15,
     "cpa_oidc_poll_timeout_sec": 15,
+    "cliproxyapi_auto_add": False,
+    "cliproxyapi_remote_base": "",
+    "cliproxyapi_management_key": "",
     "grok2api_allow_legacy_full_save": False,
     "email_provider": "duckmail",
     "yyds_api_key": "",
@@ -124,7 +131,7 @@ def validate_config_structure(raw):
         "enable_nsfw", "sso_risk_gate_enabled", "grok2api_auto_add_local", "grok2api_auto_add_remote",
         "grok2api_allow_legacy_full_save", "cpa_export_enabled",
         "cpa_copy_to_hotload", "cpa_headless", "cpa_force_standalone",
-        "cpa_mint_cookie_inject", "multi_thread_enabled",
+        "cpa_mint_cookie_inject", "cliproxyapi_auto_add", "multi_thread_enabled",
         "proxy_pool_probe_dual_stack", "proxy_pool_persist_health",
         "proxy_pool_subscription_public_only", "proxy_pool_preflight_enabled",
     )
@@ -152,7 +159,7 @@ def validate_config_structure(raw):
     for key in string_keys:
         cfg[key] = _require_string(cfg, key, path=key in path_keys)
     enums = {
-        "email_provider": {"duckmail", "yyds", "cloudflare", "cloudmail"},
+        "email_provider": {"duckmail", "yyds", "cloudflare", "cloudmail", "freemail", "mailtm", "gptmail"},
         "cloudflare_auth_mode": {"query-key", "bearer", "x-api-key", "x-admin-auth", "none"},
         "grok2api_pool_name": {"ssoBasic", "ssoSuper"},
         "proxy_mode": {"auto", "direct", "single", "pool"},
@@ -179,8 +186,8 @@ def validate_config_structure(raw):
         cfg[key] = value
 
     url_keys = {
-        "cloudflare_api_base", "cloudmail_api_base",
-        "grok2api_remote_base", "cpa_base_url",
+        "cloudflare_api_base", "cloudmail_api_base", "freemail_api_base", "mailtm_api_base", "gptmail_url",
+        "grok2api_remote_base", "cpa_base_url", "cliproxyapi_remote_base",
         "proxy_pool_subscription_url",
     }
     for key in url_keys:
@@ -210,8 +217,12 @@ def validate_run_requirements(cfg):
         ]
         if missing:
             raise ConfigError("Cloud Mail 模式缺少必需配置: " + ", ".join(missing))
+    if provider == "freemail" and not cfg["freemail_api_base"]:
+        raise ConfigError("freemail 模式需要配置 freemail_api_base")
     if provider == "yyds" and not (cfg["yyds_api_key"] or cfg["yyds_jwt"]):
         raise ConfigError("YYDS 模式需要至少配置 yyds_api_key 或 yyds_jwt")
+    if provider == "gptmail" and cfg["multi_thread_enabled"] and cfg["multi_thread_workers"] > 1:
+        raise ConfigError("GPTMail 浏览器模式暂不支持多线程注册")
 
     if cfg["proxy_mode"] == "single" and not cfg["proxy"]:
         raise ConfigError("single 代理模式必须配置 proxy")
@@ -236,6 +247,15 @@ def validate_run_requirements(cfg):
             raise ConfigError("远端 token 入池需要旧版 app_key 或新版管理员账号密码")
     if cfg["cpa_export_enabled"] and cfg["cpa_copy_to_hotload"] and not cfg["cpa_hotload_dir"]:
         raise ConfigError("启用 CPA 热加载复制时必须配置 cpa_hotload_dir")
+    if cfg["cliproxyapi_auto_add"]:
+        if not cfg["cpa_export_enabled"]:
+            raise ConfigError("CLIProxyAPI 远端上传依赖 CPA/OIDC 导出，请启用 cpa_export_enabled")
+        missing = [
+            key for key in ("cliproxyapi_remote_base", "cliproxyapi_management_key")
+            if not cfg[key]
+        ]
+        if missing:
+            raise ConfigError("CLIProxyAPI 远端上传缺少必需配置: " + ", ".join(missing))
     return cfg
 
 

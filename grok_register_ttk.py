@@ -50,6 +50,7 @@ import browser_runtime as _browser_runtime
 import mail_service as _mail_service
 import registration_browser as _registration_browser
 import sso_risk as _sso_risk
+from gptmail_provider import GPTMailProvider
 from app_config import (
     DEFAULT_CONFIG, ConfigError, config, load_config, save_config,
     validate_config, validate_config_structure, validate_run_requirements,
@@ -354,6 +355,25 @@ def sleep_with_cancel(seconds, cancel_callback=None):
         time.sleep(min(0.2, remaining))
 
 
+_gptmail_provider = None
+
+
+def get_gptmail_provider():
+    global _gptmail_provider
+    if _gptmail_provider is None:
+        _gptmail_provider = GPTMailProvider(
+            config_getter=lambda: config,
+            browser_getter=lambda: _registration_browser.browser,
+            raise_if_cancelled=raise_if_cancelled,
+            sleep_with_cancel=sleep_with_cancel,
+            cancelled_error=RegistrationCancelled,
+        )
+    return _gptmail_provider
+
+
+_mail_service.set_browser_mail_provider_factory(get_gptmail_provider)
+
+
 
 
 
@@ -596,8 +616,8 @@ def maybe_export_cpa_xai_after_success(email, password, sso="", log_callback=Non
     if result.get("ok"):
         exported_path = result.get("hotload_path") or result.get("path") or ""
         suffix = f": {exported_path}" if exported_path else ""
-        if result.get("warning") or result.get("partial") or result.get("cpa_copy_error"):
-            detail = result.get("cpa_copy_error") or "后处理未完整完成"
+        if result.get("warning") or result.get("partial") or result.get("cpa_copy_error") or result.get("cliproxyapi_upload_error"):
+            detail = result.get("cpa_copy_error") or result.get("cliproxyapi_upload_error") or "后处理未完整完成"
             logger(f"[!] CPA OIDC 凭证已生成，但存在后处理警告{suffix}: {detail}")
         else:
             logger(f"[+] CPA OIDC 导出成功{suffix}")
@@ -765,7 +785,12 @@ class GrokRegisterGUI:
 
         add_label(0, 0, "邮箱服务商:")
         self.email_provider_var = tk.StringVar(value=config.get("email_provider", "duckmail"))
-        self.email_provider_combo = tk_option_menu(config_frame, self.email_provider_var, ["duckmail", "yyds", "cloudflare", "cloudmail"], width=12)
+        self.email_provider_combo = tk_option_menu(
+            config_frame,
+            self.email_provider_var,
+            ["duckmail", "yyds", "cloudflare", "cloudmail", "freemail", "mailtm", "gptmail"],
+            width=12,
+        )
         add_field(self.email_provider_combo, 0, 1, sticky=tk.W)
 
         add_label(0, 2, "注册数量:")
@@ -985,6 +1010,38 @@ class GrokRegisterGUI:
         self.yyds_jwt_var = tk.StringVar(value=str(config.get("yyds_jwt", "")))
         self.yyds_jwt_entry = tk_entry(config_frame, textvariable=self.yyds_jwt_var, width=34, show="*")
         add_field(self.yyds_jwt_entry, 21, 3)
+
+        add_label(22, 0, "freemail API Base:")
+        self.freemail_api_base_var = tk.StringVar(value=str(config.get("freemail_api_base", "")))
+        self.freemail_api_base_entry = tk_entry(config_frame, textvariable=self.freemail_api_base_var, width=34)
+        add_field(self.freemail_api_base_entry, 22, 1)
+        add_label(22, 2, "freemail JWT:")
+        self.freemail_jwt_var = tk.StringVar(value=str(config.get("freemail_jwt", "")))
+        self.freemail_jwt_entry = tk_entry(config_frame, textvariable=self.freemail_jwt_var, width=34, show="*")
+        add_field(self.freemail_jwt_entry, 22, 3)
+
+        add_label(23, 0, "mail.tm API Base:")
+        self.mailtm_api_base_var = tk.StringVar(value=str(config.get("mailtm_api_base", "https://api.mail.tm")))
+        self.mailtm_api_base_entry = tk_entry(config_frame, textvariable=self.mailtm_api_base_var, width=34)
+        add_field(self.mailtm_api_base_entry, 23, 1)
+        add_label(23, 2, "GPTMail URL:")
+        self.gptmail_url_var = tk.StringVar(value=str(config.get("gptmail_url", "https://mail.chatgpt.org.uk/")))
+        self.gptmail_url_entry = tk_entry(config_frame, textvariable=self.gptmail_url_var, width=34)
+        add_field(self.gptmail_url_entry, 23, 3)
+
+        add_label(24, 0, "CLIProxyAPI 远端上传:")
+        self.cliproxyapi_auto_var = tk.BooleanVar(value=bool(config.get("cliproxyapi_auto_add", False)))
+        self.cliproxyapi_auto_check = tk_checkbutton(config_frame, variable=self.cliproxyapi_auto_var)
+        add_field(self.cliproxyapi_auto_check, 24, 1, sticky=tk.W)
+        add_label(24, 2, "CLIProxyAPI Base:")
+        self.cliproxyapi_base_var = tk.StringVar(value=str(config.get("cliproxyapi_remote_base", "")))
+        self.cliproxyapi_base_entry = tk_entry(config_frame, textvariable=self.cliproxyapi_base_var, width=34)
+        add_field(self.cliproxyapi_base_entry, 24, 3)
+
+        add_label(25, 0, "CLIProxyAPI Management Key:")
+        self.cliproxyapi_key_var = tk.StringVar(value=str(config.get("cliproxyapi_management_key", "")))
+        self.cliproxyapi_key_entry = tk_entry(config_frame, textvariable=self.cliproxyapi_key_var, width=72, show="*")
+        add_field(self.cliproxyapi_key_entry, 25, 1, columnspan=3)
 
         btn_frame = tk.Frame(main_frame, bg=UI_BG)
         btn_frame.grid(row=1, column=0, sticky=tk.EW, pady=(0, 6))
@@ -1210,6 +1267,10 @@ class GrokRegisterGUI:
         config["cloudmail_api_base"] = self.cloudmail_api_base_var.get().strip()
         config["cloudmail_public_token"] = self.cloudmail_public_token_var.get().strip()
         config["cloudmail_domains"] = self.cloudmail_domains_var.get().strip()
+        config["freemail_api_base"] = self.freemail_api_base_var.get().strip()
+        config["freemail_jwt"] = self.freemail_jwt_var.get().strip()
+        config["mailtm_api_base"] = self.mailtm_api_base_var.get().strip() or "https://api.mail.tm"
+        config["gptmail_url"] = self.gptmail_url_var.get().strip() or "https://mail.chatgpt.org.uk/"
         config["grok2api_auto_add_local"] = bool(self.grok2api_local_auto_var.get())
         config["grok2api_local_token_file"] = self.grok2api_local_file_var.get().strip()
         config["grok2api_pool_name"] = self.grok2api_pool_name_var.get().strip() or "ssoBasic"
@@ -1220,6 +1281,9 @@ class GrokRegisterGUI:
         config["grok2api_remote_admin_password"] = self.grok2api_remote_password_var.get()
         config["cpa_export_enabled"] = bool(self.cpa_export_var.get())
         config["cpa_auth_dir"] = self.cpa_auth_dir_var.get().strip() or "./cpa_auths"
+        config["cliproxyapi_auto_add"] = bool(self.cliproxyapi_auto_var.get())
+        config["cliproxyapi_remote_base"] = self.cliproxyapi_base_var.get().strip()
+        config["cliproxyapi_management_key"] = self.cliproxyapi_key_var.get().strip()
         config["sso_risk_gate_enabled"] = bool(self.sso_risk_var.get())
         config["multi_thread_enabled"] = bool(self.multi_thread_var.get())
         raw_paths = [x.strip() for x in self.cloudflare_paths_var.get().split(",") if x.strip()]

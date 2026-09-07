@@ -11,6 +11,10 @@
   "cloudmail_public_token": "",
   "cloudmail_domains": "example.com",
   "cloudmail_path_messages": "/api/public/emailList",
+  "freemail_api_base": "",
+  "freemail_jwt": "",
+  "mailtm_api_base": "https://api.mail.tm",
+  "gptmail_url": "https://mail.chatgpt.org.uk/",
   "proxy_mode": "auto",
   "proxy": "",
   "proxy_fallback": "none",
@@ -66,5 +70,8 @@
   "yyds_jwt": "",
   "cpa_oidc_request_timeout_sec": 15,
   "cpa_oidc_poll_timeout_sec": 15,
+  "cliproxyapi_auto_add": false,
+  "cliproxyapi_remote_base": "",
+  "cliproxyapi_management_key": "",
   "grok2api_allow_legacy_full_save": false
 }

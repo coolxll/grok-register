@@ -1,4 +1,5 @@
 """接入临时邮箱服务并负责邮箱创建、邮件轮询和验证码提取。"""
+import html
 import re
 import secrets
 import string
@@ -16,6 +17,7 @@ YYDS_API_BASE = "https://maliapi.215.im/v1"
 config = {}
 _cf_domain_index = 0
 _cloudmail_domain_index = 0
+_browser_mail_provider_factory = None
 
 
 def _detail_retry_attempt(state, message_id, now=None):
@@ -43,7 +45,9 @@ def bind_runtime(namespace):
     global config
     config = namespace.get("config", config)
     for name, value in namespace.items():
-        if name.startswith("__") or name in _OWN_NAMES or name in {"config", "_cf_domain_index", "_cloudmail_domain_index"}:
+        if name.startswith("__") or name in _OWN_NAMES or name in {
+            "config", "_cf_domain_index", "_cloudmail_domain_index", "_browser_mail_provider_factory"
+        }:
             continue
         globals()[name] = value
 
@@ -66,6 +70,140 @@ def normalize_mail_body(*sources):
             if isinstance(item, str) and item.strip():
                 parts.append(re.sub(r"<[^>]+>", " ", item))
     return "\n".join(parts)
+
+
+def normalize_verification_code(value):
+    compact = re.sub(r"[\s\u200b\ufeff\u2010-\u2015\u2212-]+", "", str(value or "")).strip()
+    return compact if re.fullmatch(r"[A-Za-z0-9]{4,12}", compact) else ""
+
+
+_TARGET_BRAND_PATTERN = re.compile(r"\b(?:grok|xai|x\.ai|x\.com|grok\.com|twitter)\b", re.IGNORECASE)
+_TARGET_STANDALONE_X_PATTERN = re.compile(r"(?:^|\s)x(?:\s+team)?(?:\s|$)", re.IGNORECASE)
+_TARGET_VERIFY_PATTERN = re.compile(
+    r"(?:verify(?:\s+your)?\s+(?:email|account)|email\s+verification|"
+    r"verification\s+(?:code|number)|security\s+code|confirmation\s+code|"
+    r"passcode|one[- ]time|login\s+code|temporary\s+code|otp|"
+    r"confirm(?:ation)?\s+(?:your\s+)?email|验证码|驗證碼|确认码|確認碼)",
+    re.IGNORECASE,
+)
+_TARGET_CODE_PATTERN = re.compile(r"(?:\b(?:code|otp|passcode|token)\b|验证码|驗證碼|确认码|確認碼)", re.IGNORECASE)
+_TARGET_NEGATIVE_PATTERN = re.compile(
+    r"(?:newsletter|unsubscribe|marketing|广告|通知中心|telegram|reset\s+(?:your\s+)?password|password\s+reset)",
+    re.IGNORECASE,
+)
+
+
+def _target_email_searchable(item):
+    if not isinstance(item, dict):
+        return ""
+    values = []
+    for key in (
+        "sender", "from", "from_address", "fromAddress", "subject", "preview", "snippet",
+        "intro", "text", "content", "body", "raw", "verification_code", "code", "title",
+    ):
+        value = item.get(key, "")
+        if isinstance(value, (dict, list)):
+            value = str(value)
+        if value:
+            values.append(str(value))
+    return " ".join(values).strip()
+
+
+def score_target_verification_email(item):
+    searchable = _target_email_searchable(item)
+    if not searchable:
+        return 0, []
+    score = 0
+    reasons = []
+    if _TARGET_BRAND_PATTERN.search(searchable) or _TARGET_STANDALONE_X_PATTERN.search(searchable):
+        score += 20
+        reasons.append("brand")
+    if _TARGET_VERIFY_PATTERN.search(searchable):
+        score += 12
+        reasons.append("verification")
+    if _TARGET_CODE_PATTERN.search(searchable):
+        score += 5
+        reasons.append("code")
+    if _TARGET_NEGATIVE_PATTERN.search(searchable):
+        score -= 14
+        reasons.append("negative")
+    return score, reasons
+
+
+def select_target_verification_email(candidates):
+    ranked = []
+    for item in candidates or []:
+        score, reasons = score_target_verification_email(item)
+        if score > 0:
+            ranked.append((score, reasons, item))
+    ranked.sort(key=lambda value: (value[0], -len(str(value[2].get("text", "")))), reverse=True)
+    if not ranked:
+        return None, []
+    best_score, _, best = ranked[0]
+    second_score = ranked[1][0] if len(ranked) > 1 else None
+    searchable = _target_email_searchable(best)
+    has_brand = bool(_TARGET_BRAND_PATTERN.search(searchable) or _TARGET_STANDALONE_X_PATTERN.search(searchable))
+    has_code_semantics = bool(_TARGET_VERIFY_PATTERN.search(searchable) or _TARGET_CODE_PATTERN.search(searchable))
+    if has_brand and best_score >= 20:
+        return (best, ranked) if has_code_semantics else (None, ranked)
+    if best_score < 12:
+        return None, ranked
+    if second_score is not None and best_score - second_score < 4:
+        return None, ranked
+    return best, ranked
+
+
+def select_messages_for_code(candidates):
+    values = list(candidates or [])
+    target, ranked = select_target_verification_email(values)
+    if target is not None:
+        return [target], ranked
+    if len(values) == 1:
+        return values, ranked
+    return [], ranked
+
+
+def extract_flexible_verification_code(text, subject=""):
+    """更宽松的 provider 解析器；不改变上游共享解析器的返回格式。"""
+    direct = extract_verification_code(text, subject)
+    if direct:
+        return normalize_verification_code(direct) or direct
+
+    source = html.unescape(f"{subject or ''}\n{text or ''}")
+    source = re.sub(r"<[^>]*>", " ", source)
+    source = re.sub(r"[\u200b\ufeff]", "", source)
+    source = re.sub(r"[\u2010-\u2015\u2212]", "-", source)
+    source = re.sub(r"\s+", " ", source)
+    candidate = r"([A-Z0-9]{4,10}|[A-Z0-9]{3}[\s-]+[A-Z0-9]{3}|\d{3}[\s-]+\d{3})"
+    patterns = [
+        rf"(?:verification code|security code|confirmation code|passcode|one[- ]time (?:password|code)|login code|otp|验证码|驗證碼|确认码|確認碼)(?:\s|:|：|is|为|是){{0,18}}{candidate}",
+        rf"(?:use|enter|copy)(?:\s|:|：|this|the|temporary|verification|code){{0,18}}{candidate}(?:\s|:|：|to|for|as){{0,18}}(?:continue|verify|sign in)",
+        rf"{candidate}(?:\s|:|：|is|为|是){{0,18}}(?:your verification code|your security code|your passcode|您的验证码|你的验证码)",
+    ]
+    for pattern in patterns:
+        match = re.search(pattern, source, re.IGNORECASE)
+        if not match:
+            continue
+        raw = match.group(1)
+        grouped = bool(re.fullmatch(r"[A-Za-z0-9]{3}[\s-]+[A-Za-z0-9]{3}", raw))
+        code = normalize_verification_code(raw)
+        if code and (any(char.isdigit() for char in code) or grouped):
+            return code
+    return None
+
+
+def set_browser_mail_provider_factory(factory):
+    global _browser_mail_provider_factory
+    _browser_mail_provider_factory = factory
+
+
+def _get_browser_mail_provider():
+    if _browser_mail_provider_factory is None:
+        raise RuntimeError("浏览器邮箱 provider 尚未初始化")
+    provider = _browser_mail_provider_factory()
+    if provider is None:
+        raise RuntimeError("浏览器邮箱 provider 不可用")
+    return provider
 
 
 def _pick_list_payload(data):
@@ -591,12 +729,241 @@ def get_domains(api_key=None):
 def get_duckmail_api_key():
     return config.get("duckmail_api_key", "")
 
+
+def get_freemail_api_base():
+    value = str(config.get("freemail_api_base", "") or "").rstrip("/")
+    if not value:
+        raise Exception("freemail_api_base 未配置")
+    return value
+
+
+def freemail_build_headers():
+    jwt = str(config.get("freemail_jwt", "") or "").strip()
+    headers = {"Content-Type": "application/json"}
+    if jwt:
+        headers["Authorization"] = f"Bearer {jwt}"
+    return headers
+
+
+def freemail_get_email_and_token():
+    resp = http_get(f"{get_freemail_api_base()}/api/generate", headers=freemail_build_headers())
+    resp.raise_for_status()
+    data = resp.json()
+    address = data.get("email") if isinstance(data, dict) else None
+    if not address:
+        raise Exception(f"freemail /api/generate 返回数据缺少 email: {data}")
+    # registration_browser expects a truthy mailbox credential.
+    return address, "freemail"
+
+
+def freemail_get_messages(address, limit=50):
+    resp = http_get(
+        f"{get_freemail_api_base()}/api/emails",
+        params={"mailbox": address, "limit": limit},
+        headers=freemail_build_headers(),
+    )
+    resp.raise_for_status()
+    data = resp.json()
+    return data if isinstance(data, list) else []
+
+
+def freemail_get_message_detail(message_id):
+    resp = http_get(
+        f"{get_freemail_api_base()}/api/email/{message_id}",
+        headers=freemail_build_headers(),
+    )
+    resp.raise_for_status()
+    return resp.json()
+
+
+def freemail_get_oai_code(
+    dev_token,
+    email,
+    timeout=180,
+    poll_interval=3,
+    log_callback=None,
+    cancel_callback=None,
+    resend_callback=None,
+):
+    del dev_token
+    deadline = time.time() + timeout
+    seen_ids = set()
+    next_resend_at = time.time() + 35
+    while time.time() < deadline:
+        raise_if_cancelled(cancel_callback)
+        if resend_callback and time.time() >= next_resend_at:
+            try:
+                resend_callback()
+                if log_callback:
+                    log_callback("[*] 已触发重新发送验证码")
+            except Exception as exc:
+                if log_callback:
+                    log_callback(f"[Debug] 触发重发验证码失败: {exc}")
+            next_resend_at = time.time() + 35
+        try:
+            messages = freemail_get_messages(email)
+        except Exception as exc:
+            if log_callback:
+                log_callback(f"[Debug] freemail 拉取邮件列表失败: {exc}")
+            sleep_with_cancel(poll_interval, cancel_callback)
+            continue
+        messages, _ = select_messages_for_code(messages)
+        for msg in messages:
+            msg_id = msg.get("id")
+            if not msg_id or msg_id in seen_ids:
+                continue
+            seen_ids.add(msg_id)
+            subject = str(msg.get("subject", "") or "")
+            code = normalize_verification_code(msg.get("verification_code"))
+            if code:
+                if log_callback:
+                    log_callback(f"[*] freemail 自动提取验证码: {code}")
+                return code
+            try:
+                detail = freemail_get_message_detail(msg_id)
+            except Exception as exc:
+                if log_callback:
+                    log_callback(f"[Debug] freemail 获取邮件详情失败: {exc}")
+                continue
+            code = normalize_verification_code(detail.get("verification_code")) if isinstance(detail, dict) else ""
+            if not code and isinstance(detail, dict):
+                content = "\n".join(
+                    str(value or "")
+                    for value in (detail.get("content"), detail.get("html_content"))
+                    if value
+                )
+                code = extract_flexible_verification_code(content, subject)
+            if log_callback:
+                log_callback(f"[Debug] freemail 收到邮件: {subject}")
+            if code:
+                if log_callback:
+                    log_callback(f"[*] freemail 解析验证码: {code}")
+                return code
+        sleep_with_cancel(poll_interval, cancel_callback)
+    raise VerificationCodeUnavailable(f"freemail 在 {timeout}s 内未收到验证码邮件")
+
+
+def get_mailtm_api_base():
+    return str(config.get("mailtm_api_base", "") or "https://api.mail.tm").rstrip("/")
+
+
+def mailtm_get_email_and_token():
+    base = get_mailtm_api_base()
+    resp = http_get(f"{base}/domains")
+    resp.raise_for_status()
+    domains = resp.json().get("hydra:member", [])
+    active = [item for item in domains if item.get("isActive")]
+    if not active:
+        raise Exception("mail.tm 没有活跃的域名")
+    domain = active[0].get("domain")
+    if not domain:
+        raise Exception("mail.tm 域名数据格式错误")
+    address = f"{generate_username(10)}@{domain}"
+    password = secrets.token_urlsafe(12)
+    resp = http_post(
+        f"{base}/accounts",
+        json={"address": address, "password": password},
+        headers={"Content-Type": "application/json"},
+    )
+    resp.raise_for_status()
+    if not resp.json().get("id"):
+        raise Exception("mail.tm 创建账号失败")
+    resp = http_post(
+        f"{base}/token",
+        json={"address": address, "password": password},
+        headers={"Content-Type": "application/json"},
+    )
+    resp.raise_for_status()
+    token = resp.json().get("token")
+    if not token:
+        raise Exception("mail.tm 获取 token 失败")
+    return address, token
+
+
+def mailtm_get_messages(token):
+    resp = http_get(
+        f"{get_mailtm_api_base()}/messages",
+        headers={"Authorization": f"Bearer {token}"},
+    )
+    resp.raise_for_status()
+    return resp.json().get("hydra:member", [])
+
+
+def mailtm_get_message_detail(message_id, token):
+    resp = http_get(
+        f"{get_mailtm_api_base()}/messages/{message_id}",
+        headers={"Authorization": f"Bearer {token}"},
+    )
+    resp.raise_for_status()
+    return resp.json()
+
+
+def mailtm_get_oai_code(
+    dev_token,
+    email,
+    timeout=180,
+    poll_interval=3,
+    log_callback=None,
+    cancel_callback=None,
+    resend_callback=None,
+):
+    del email
+    deadline = time.time() + timeout
+    seen_ids = set()
+    next_resend_at = time.time() + 35
+    while time.time() < deadline:
+        raise_if_cancelled(cancel_callback)
+        if resend_callback and time.time() >= next_resend_at:
+            try:
+                resend_callback()
+                if log_callback:
+                    log_callback("[*] 已触发重新发送验证码")
+            except Exception as exc:
+                if log_callback:
+                    log_callback(f"[Debug] 触发重发验证码失败: {exc}")
+            next_resend_at = time.time() + 35
+        try:
+            messages = mailtm_get_messages(dev_token)
+        except Exception as exc:
+            if log_callback:
+                log_callback(f"[Debug] mail.tm 拉取邮件列表失败: {exc}")
+            sleep_with_cancel(poll_interval, cancel_callback)
+            continue
+        messages, _ = select_messages_for_code(messages)
+        for msg in messages:
+            msg_id = msg.get("id")
+            if not msg_id or msg_id in seen_ids:
+                continue
+            seen_ids.add(msg_id)
+            subject = str(msg.get("subject", "") or "")
+            try:
+                detail = mailtm_get_message_detail(msg_id, dev_token)
+            except Exception as exc:
+                if log_callback:
+                    log_callback(f"[Debug] mail.tm 获取邮件详情失败: {exc}")
+                continue
+            code = extract_flexible_verification_code(normalize_mail_body(detail), subject)
+            if log_callback:
+                log_callback(f"[Debug] mail.tm 收到邮件: {subject}")
+            if code:
+                if log_callback:
+                    log_callback(f"[*] mail.tm 解析验证码: {code}")
+                return code
+        sleep_with_cancel(poll_interval, cancel_callback)
+    raise VerificationCodeUnavailable(f"mail.tm 在 {timeout}s 内未收到验证码邮件")
+
 def get_email_and_token(api_key=None):
     provider = get_email_provider()
     if provider == "yyds":
         return yyds_get_email_and_token(api_key=api_key, jwt=get_yyds_jwt())
     if provider == "cloudmail":
         return cloudmail_get_email_and_token()
+    if provider == "freemail":
+        return freemail_get_email_and_token()
+    if provider == "mailtm":
+        return mailtm_get_email_and_token()
+    if provider == "gptmail":
+        return _get_browser_mail_provider().get_email_and_token()
     if provider == "cloudflare":
         api_base = get_cloudflare_api_base()
         if not api_base:
@@ -691,6 +1058,36 @@ def get_oai_code(
         )
     if provider == "cloudmail":
         return cloudmail_get_oai_code(
+            dev_token,
+            email,
+            timeout=timeout,
+            poll_interval=poll_interval,
+            log_callback=log_callback,
+            cancel_callback=cancel_callback,
+            resend_callback=resend_callback,
+        )
+    if provider == "freemail":
+        return freemail_get_oai_code(
+            dev_token,
+            email,
+            timeout=timeout,
+            poll_interval=poll_interval,
+            log_callback=log_callback,
+            cancel_callback=cancel_callback,
+            resend_callback=resend_callback,
+        )
+    if provider == "mailtm":
+        return mailtm_get_oai_code(
+            dev_token,
+            email,
+            timeout=timeout,
+            poll_interval=poll_interval,
+            log_callback=log_callback,
+            cancel_callback=cancel_callback,
+            resend_callback=resend_callback,
+        )
+    if provider == "gptmail":
+        return _get_browser_mail_provider().get_oai_code(
             dev_token,
             email,
             timeout=timeout,

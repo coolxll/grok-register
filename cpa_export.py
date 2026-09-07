@@ -1,13 +1,16 @@
 """在注册成功后可选生成 CPA xAI OIDC 凭证并复制到热加载目录。"""
 from dataclasses import dataclass
 import importlib.util
+import json
 import os
 import shutil
 import sys
 import time
+import urllib.parse
 from pathlib import Path
 from typing import Optional
 
+from curl_cffi import requests
 from filelock import FileLock
 from proxy_bridge import http_compatible_proxy
 from proxy_pool import current_proxy_url
@@ -31,6 +34,9 @@ class CpaExportSettings:
     force_standalone: bool
     cookie_inject: bool
     tools_dir: str
+    cliproxyapi_auto_add: bool
+    cliproxyapi_remote_base: str
+    cliproxyapi_management_key: str
 
     @classmethod
     def from_config(cls, config):
@@ -64,7 +70,35 @@ class CpaExportSettings:
             force_standalone=bool(cfg.get("cpa_force_standalone", True)),
             cookie_inject=bool(cfg.get("cpa_mint_cookie_inject", True)),
             tools_dir=str(cfg.get("api_reverse_tools") or "").strip(),
+            cliproxyapi_auto_add=bool(cfg.get("cliproxyapi_auto_add", False)),
+            cliproxyapi_remote_base=str(cfg.get("cliproxyapi_remote_base") or "").strip().rstrip("/"),
+            cliproxyapi_management_key=str(cfg.get("cliproxyapi_management_key") or "").strip(),
         )
+
+
+def _upload_to_cliproxyapi(path, settings):
+    source = Path(path)
+    with source.open("r", encoding="utf-8") as handle:
+        payload = json.load(handle)
+    filename = source.name
+    url = "%s/v0/management/auth-files?name=%s" % (
+        settings.cliproxyapi_remote_base,
+        urllib.parse.quote(filename),
+    )
+    with http_compatible_proxy(settings.proxy or None) as compatible_proxy:
+        kwargs = {
+            "json": payload,
+            "headers": {
+                "Authorization": "Bearer %s" % settings.cliproxyapi_management_key,
+                "Content-Type": "application/json",
+            },
+            "timeout": 30,
+        }
+        if compatible_proxy:
+            kwargs["proxies"] = {"http": compatible_proxy, "https": compatible_proxy}
+        response = requests.post(url, **kwargs)
+        response.raise_for_status()
+    return filename
 
 
 def _load_mint_and_export(tools_dir=""):
@@ -196,6 +230,16 @@ def export_cpa_xai_for_account(email, password, page=None, cookies=None, sso=Non
             result["warning"] = True
             result["partial"] = True
             log("[cpa] hotload copy failed: %s" % exc)
+    if result.get("ok") and result.get("path") and settings.cliproxyapi_auto_add:
+        try:
+            filename = _upload_to_cliproxyapi(result["path"], settings)
+            result["cliproxyapi_filename"] = filename
+            log("[cpa] CLIProxyAPI remote upload -> %s" % filename)
+        except Exception as exc:
+            result["cliproxyapi_upload_error"] = str(exc)
+            result["warning"] = True
+            result["partial"] = True
+            log("[cpa] CLIProxyAPI remote upload failed: %s" % exc)
     if not result.get("ok"):
         fail_path = settings.auth_dir / "cpa_auth_failed.txt"
         try:

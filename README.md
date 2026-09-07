@@ -2,7 +2,7 @@
 
 [![Grok Register — GUI, CLI and WebUI registration automation toolkit](assets/banner.png)](https://github.com/AaronL725/grok-register)
 
-Grok Register 是一个面向自动化流程研究、测试环境验证和个人学习的 Python 工具。项目提供 GUI / CLI / WebUI、四种临时邮箱、可选 1–8 线程并发与账号级代理池，并集成 Chromium 页面自动化、账号安全落盘、pending 恢复、grok2api token 入池和可选 CPA xAI OIDC 凭证导出。
+Grok Register 是一个面向自动化流程研究、测试环境验证和个人学习的 Python 工具。项目提供 GUI / CLI / WebUI、多种临时邮箱、可选 1–8 线程并发与账号级代理池，并集成 Chromium 页面自动化、账号安全落盘、pending 恢复、grok2api token 入池和可选 CPA xAI OIDC 凭证导出。
 
 <p>
   <a href="LICENSE"><img src="https://img.shields.io/badge/License-MIT-blue.svg" alt="License: MIT"></a>
@@ -79,7 +79,7 @@ Grok Register 使用真实 Chromium / Chrome 完成注册流程，并把 GUI、C
 主要功能：
 
 - 自动打开注册页、提交邮箱、轮询验证码、填写资料并获取 SSO cookie。
-- 支持 **DuckMail / YYDS / Cloudflare 临时邮箱 / Cloud Mail** 四种邮箱来源。
+- 支持 **DuckMail / YYDS / Cloudflare 临时邮箱 / Cloud Mail / freemail / mail.tm / GPTMail** 七种邮箱来源；GPTMail 使用当前 Chromium 的独立收件箱 tab。
 - 支持 **GUI / CLI / WebUI** 三种操作入口。
 - 支持可选 **1–8 线程并发注册**；默认关闭。
 - 支持 `direct / single / pool` 代理模式、健康检查、冷却、订阅、固定/旋转节点和账号级稳定 Proxy Lease。
@@ -87,7 +87,7 @@ Grok Register 使用真实 Chromium / Chrome 完成注册流程，并把 GUI、C
 - 支持注册后尝试开启 NSFW；失败不会丢失已经注册成功的账号。
 - 支持 SSO 入库前筛查 `botFlagSource` / `policy=deny`；明确命中后隔离并跳过 grok2api / CPA。风控检查采用 fail-open：网络请求失败、HTTP 异常或未解析到风控字段时会记录诊断并继续入库。
 - 支持把 SSO token 写入 grok2api 本地池或远端池。
-- 支持可选 CPA xAI OIDC 凭证导出与 CLIProxyAPI hotload。
+- 支持可选 CPA xAI OIDC 凭证导出、CLIProxyAPI 本地 hotload，以及直接上传到远端 CLIProxyAPI Management API。
 - 成功账号实时落盘；主账号结果写入失败时会进入对应的 `accounts_*.txt.pending.jsonl`，可稍后幂等恢复。风控隔离写入失败使用独立的 risk pending，不与普通账号 pending 混用。
 - 支持停止任务、浏览器重启、邮箱重试、运行时清理和后处理错误隔离。
 
@@ -244,7 +244,7 @@ CLI 读取 `config.json`，通过校验后提示：
 
 | 配置项 | 说明 |
 | --- | --- |
-| `email_provider` | `duckmail` / `yyds` / `cloudflare` / `cloudmail` |
+| `email_provider` | `duckmail` / `yyds` / `cloudflare` / `cloudmail` / `freemail` / `mailtm` / `gptmail` |
 | `register_count` | 本批次注册数量 |
 | `enable_nsfw` | 注册后是否尝试开启 NSFW |
 | `sso_risk_gate_enabled` | 入库前是否检查 grok.com `botFlagSource` / `policy=deny`，默认 `true` |
@@ -330,6 +330,40 @@ Admin 创建示例：
   "cloudmail_path_messages": "/api/public/emailList"
 }
 ```
+
+#### freemail
+
+```json
+{
+  "email_provider": "freemail",
+  "freemail_api_base": "https://你的-freemail-域名",
+  "freemail_jwt": "你的 JWT_TOKEN"
+}
+```
+
+`freemail_jwt` 为空时不发送认证头；配置后使用 `Authorization: Bearer <token>`。当前适配 `/api/generate`、`/api/emails` 和 `/api/email/{id}` 接口。
+
+#### mail.tm
+
+```json
+{
+  "email_provider": "mailtm",
+  "mailtm_api_base": "https://api.mail.tm"
+}
+```
+
+默认直接使用 mail.tm 标准 API，也可以把 `mailtm_api_base` 指向兼容部署。
+
+#### GPTMail 浏览器收件箱
+
+```json
+{
+  "email_provider": "gptmail",
+  "gptmail_url": "https://mail.chatgpt.org.uk/"
+}
+```
+
+GPTMail 不走 HTTP 邮箱 API，而是在当前注册 Chromium 中打开独立 tab 收取验证码。为避免多个 worker 争用同一个浏览器收件箱，当前 GPTMail 模式禁止多线程注册。
 
 ## 代理与代理池
 
@@ -481,6 +515,9 @@ ss://...
   "cpa_mint_cookie_inject": true,
   "cpa_oidc_request_timeout_sec": 15,
   "cpa_oidc_poll_timeout_sec": 15,
+  "cliproxyapi_auto_add": false,
+  "cliproxyapi_remote_base": "",
+  "cliproxyapi_management_key": "",
   "api_reverse_tools": ""
 }
 ```
@@ -488,7 +525,10 @@ ss://...
 - `cpa_copy_to_hotload=true` 时必须填写 `cpa_hotload_dir`。
 - 显式 `cpa_proxy` 始终优先。
 - 未配置 `cpa_proxy` 且当前账号使用 Proxy Lease 时，CPA 会继承同一个出口，包括高级协议对应的 localhost runtime。
+- `cliproxyapi_auto_add=true` 时，程序直接复用 CPA 已生成的 `xai-*.json`，上传到 `<cliproxyapi_remote_base>/v0/management/auth-files`；不再额外执行第二套 OIDC Device Flow。
+- 远端 CLIProxyAPI 上传需要同时配置 `cliproxyapi_remote_base` 和 `cliproxyapi_management_key`，并依赖 `cpa_export_enabled=true`。
 - CPA 导出失败只记录后处理警告，不会删除已保存账号。
+- CLIProxyAPI 远端上传失败同样只记为后处理 warning，不影响已经成功保存的账号和本地 CPA 凭证。
 
 ## 输出与 pending 恢复
 
@@ -528,7 +568,8 @@ python grok_register_ttk.py retry-pending <pending文件> [输出文件]
 ├── proxy_bridge.py            # HTTP/HTTPS/SOCKS → localhost HTTP 代理桥与 Chromium 兼容
 ├── proxy_protocols.py         # HTTP/SOCKS/VLESS/VMess/Trojan/HY2/TUIC/SS 订阅解析
 ├── proxy_protocol_runtime.py  # Native bridge / sing-box lazy runtime 与 idle cache
-├── mail_service.py            # 四种邮箱服务
+├── mail_service.py            # HTTP 邮箱服务与共享验证码解析
+├── gptmail_provider.py        # GPTMail 浏览器收件箱 provider
 ├── app_config.py              # 默认配置、校验、加载与保存
 ├── account_outputs.py         # 账号、pending 与 token 输出
 ├── sso_risk.py                # SSO botFlag / policy 早停
