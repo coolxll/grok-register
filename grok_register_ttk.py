@@ -1,4 +1,4 @@
-﻿#!/usr/bin/env python
+#!/usr/bin/env python
 # -*- coding: utf-8 -*-
 """
 Grok 注册机 - TTK GUI 版本
@@ -33,8 +33,19 @@ from DrissionPage import Chromium, ChromiumOptions
 from DrissionPage.errors import PageDisconnectedError
 from curl_cffi import requests
 
+from providers import cloudflare, duckmail, freemail, mailtm, yyds
+from providers.common import (
+    ProviderContext,
+    extract_verification_code,
+    generate_username,
+    normalize_verification_code,
+)
+from providers.gptmail import GPTMailProvider
 
-CONFIG_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "config.json")
+
+PROJECT_DIR = os.path.dirname(os.path.abspath(__file__))
+CONFIG_FILE = os.path.join(PROJECT_DIR, "config.json")
+ACCOUNTS_OUTPUT_DIR = os.path.join(PROJECT_DIR, "accounts")
 MEMORY_CLEANUP_INTERVAL = 5
 
 UI_BG = "#242424"
@@ -56,6 +67,8 @@ DEFAULT_CONFIG = {
     "cloudflare_path_messages": "/api/mails",
     "freemail_api_base": "",
     "freemail_jwt": "",
+    "mailtm_api_base": "https://api.mail.tm",
+    "gptmail_url": "https://mail.chatgpt.org.uk/",
     "proxy": "http://127.0.0.1:7890",
     "enable_nsfw": True,
     "register_count": 1,
@@ -72,7 +85,6 @@ DEFAULT_CONFIG = {
 }
 
 config = DEFAULT_CONFIG.copy()
-_cf_domain_index = 0
 
 
 class RegistrationCancelled(Exception):
@@ -81,6 +93,10 @@ class RegistrationCancelled(Exception):
 
 class AccountRetryNeeded(Exception):
     pass
+
+
+class EmailSubmissionFailed(Exception):
+    """邮箱提交后没有确认进入验证码步骤，当前邮箱需要被替换。"""
 
 
 def load_config():
@@ -143,9 +159,6 @@ load_config()
 EXTENSION_PATH = os.path.abspath(
     os.path.join(os.path.dirname(__file__), "turnstilePatch")
 )
-
-
-DUCKMAIL_API_BASE = "https://api.duckmail.sbs"
 
 
 def get_configured_proxy():
@@ -412,116 +425,6 @@ def prepare_browser_proxy(use_proxy=True, log_callback=None):
             log_callback("[!] Chromium 暂不直接支持该认证代理协议，已使用去认证代理地址，失败将回退直连")
         return stripped, None
     return proxy, None
-
-
-def get_duckmail_api_key():
-    return config.get("duckmail_api_key", "")
-
-
-def get_cloudflare_api_base():
-    return str(config.get("cloudflare_api_base", "") or "").rstrip("/")
-
-
-def get_cloudflare_api_key():
-    return config.get("cloudflare_api_key", "")
-
-
-def get_cloudflare_auth_mode():
-    return str(config.get("cloudflare_auth_mode", "none") or "none").lower()
-
-
-def get_cloudflare_path(key, default_path):
-    raw = str(config.get(key, default_path) or default_path).strip()
-    if not raw.startswith("/"):
-        raw = "/" + raw
-    return raw
-
-
-def cloudflare_build_headers(content_type=False):
-    headers = {"Content-Type": "application/json"} if content_type else {}
-    key = get_cloudflare_api_key()
-    mode = get_cloudflare_auth_mode()
-    if key:
-        if mode == "x-api-key":
-            headers["X-API-Key"] = key
-        elif mode == "x-admin-auth":
-            headers["x-admin-auth"] = key
-        elif mode != "none":
-            headers["Authorization"] = f"Bearer {key}"
-    return headers
-
-
-def cloudflare_apply_auth_params(params=None):
-    merged = dict(params or {})
-    key = get_cloudflare_api_key()
-    mode = get_cloudflare_auth_mode()
-    if key and mode == "query-key":
-        merged["key"] = key
-    return merged
-
-
-def cloudflare_next_default_domain():
-    """按配置轮换选择 Cloudflare 临时邮箱域名。"""
-    global _cf_domain_index
-    domains = [x.strip() for x in str(config.get("defaultDomains", "") or "").split(",") if x.strip()]
-    if not domains:
-        return ""
-    domain = domains[_cf_domain_index % len(domains)]
-    _cf_domain_index += 1
-    return domain
-
-
-def cloudflare_is_admin_create_path(path):
-    """判断当前创建邮箱路径是否为 cloudflare_temp_email 管理员创建接口。"""
-    return str(path or "").rstrip("/").lower() == "/admin/new_address"
-
-
-def _pick_list_payload(data):
-    if isinstance(data, list):
-        return data
-    if isinstance(data, dict):
-        if isinstance(data.get("results"), list):
-            return data.get("results")
-        if isinstance(data.get("hydra:member"), list):
-            return data.get("hydra:member")
-        if isinstance(data.get("data"), list):
-            return data.get("data")
-        if isinstance(data.get("messages"), list):
-            return data.get("messages")
-        if isinstance(data.get("data"), dict):
-            nested = data.get("data")
-            if isinstance(nested.get("messages"), list):
-                return nested.get("messages")
-    return []
-
-
-def cloudflare_create_temp_address(api_base):
-    """适配 cloudflare_temp_email 新建地址接口并兼容 admin 创建模式。"""
-    path = get_cloudflare_path("cloudflare_path_accounts", "/api/new_address")
-    url = f"{api_base}{path}"
-    domain = cloudflare_next_default_domain()
-    is_admin_create = cloudflare_is_admin_create_path(path)
-    if is_admin_create:
-        payload = {"name": generate_username(10), "enablePrefix": True}
-        if domain:
-            payload["domain"] = domain
-        headers = cloudflare_build_headers(content_type=True)
-    else:
-        payload = {}
-        if domain:
-            payload["domain"] = domain
-        headers = {"Content-Type": "application/json"}
-    resp = http_post(url, json=payload, headers=headers)
-    resp.raise_for_status()
-    try:
-        data = resp.json()
-    except Exception:
-        raise Exception(f"Cloudflare {path} 返回非JSON: {resp.text[:300]}")
-    address = data.get("address")
-    jwt = data.get("jwt")
-    if not address or not jwt:
-        raise Exception(f"Cloudflare {path} 缺少 address/jwt: {data}")
-    return address, jwt
 
 
 def get_user_agent():
@@ -1027,7 +930,7 @@ def http_post(url, **kwargs):
 
 def raise_if_cancelled(cancel_callback=None):
     if cancel_callback and cancel_callback():
-        raise RegistrationCancelled("鐢ㄦ埛鍋滄娉ㄥ唽")
+        raise RegistrationCancelled("用户停止注册")
 
 
 def sleep_with_cancel(seconds, cancel_callback=None):
@@ -1040,534 +943,57 @@ def sleep_with_cancel(seconds, cancel_callback=None):
         time.sleep(min(0.2, remaining))
 
 
-def get_domains(api_key=None):
-    headers = {}
-    key = api_key or get_duckmail_api_key()
-    if key:
-        headers["Authorization"] = f"Bearer {key}"
-    resp = http_get(f"{DUCKMAIL_API_BASE}/domains", headers=headers)
-    resp.raise_for_status()
-    return resp.json().get("hydra:member", [])
-
-
-def create_account(address, password, api_key=None, expires_in=0):
-    headers = {"Content-Type": "application/json"}
-    key = api_key or get_duckmail_api_key()
-    if key:
-        headers["Authorization"] = f"Bearer {key}"
-    data = {"address": address, "password": password, "expiresIn": expires_in}
-    resp = http_post(f"{DUCKMAIL_API_BASE}/accounts", json=data, headers=headers)
-    resp.raise_for_status()
-    return resp.json()
-
-
-def get_token(address, password):
-    data = {"address": address, "password": password}
-    resp = http_post(f"{DUCKMAIL_API_BASE}/token", json=data)
-    resp.raise_for_status()
-    return resp.json().get("token")
-
-
-def get_messages(token):
-    headers = {"Authorization": f"Bearer {token}"}
-    resp = http_get(f"{DUCKMAIL_API_BASE}/messages", headers=headers)
-    resp.raise_for_status()
-    return resp.json().get("hydra:member", [])
-
-
-def get_message_detail(token, message_id):
-    headers = {"Authorization": f"Bearer {token}"}
-    resp = http_get(f"{DUCKMAIL_API_BASE}/messages/{message_id}", headers=headers)
-    resp.raise_for_status()
-    return resp.json()
-
-
-def cloudflare_get_domains(api_base, api_key=None):
-    headers = cloudflare_build_headers(content_type=False)
-    if api_key and "Authorization" in headers:
-        headers["Authorization"] = f"Bearer {api_key}"
-    if api_key and "X-API-Key" in headers:
-        headers["X-API-Key"] = api_key
-    path = get_cloudflare_path("cloudflare_path_domains", "/domains")
-    params = cloudflare_apply_auth_params()
-    resp = http_get(f"{api_base}{path}", headers=headers, params=params)
-    resp.raise_for_status()
-    return _pick_list_payload(resp.json())
-
-
-def cloudflare_create_account(api_base, address, password, api_key=None, expires_in=0):
-    headers = cloudflare_build_headers(content_type=True)
-    if api_key and "Authorization" in headers:
-        headers["Authorization"] = f"Bearer {api_key}"
-    if api_key and "X-API-Key" in headers:
-        headers["X-API-Key"] = api_key
-    payload = {"address": address, "password": password, "expiresIn": expires_in}
-    path = get_cloudflare_path("cloudflare_path_accounts", "/accounts")
-    params = cloudflare_apply_auth_params()
-    resp = http_post(f"{api_base}{path}", json=payload, headers=headers, params=params)
-    resp.raise_for_status()
-    return resp.json()
-
-
-def cloudflare_get_token(api_base, address, password, api_key=None):
-    headers = cloudflare_build_headers(content_type=True)
-    if api_key and "Authorization" in headers:
-        headers["Authorization"] = f"Bearer {api_key}"
-    if api_key and "X-API-Key" in headers:
-        headers["X-API-Key"] = api_key
-    path = get_cloudflare_path("cloudflare_path_token", "/token")
-    resp = http_post(
-        f"{api_base}{path}",
-        json={"address": address, "password": password},
-        headers=headers,
-        params=cloudflare_apply_auth_params(),
+def get_provider_context():
+    """创建 provider 使用的共享上下文。每次调用都读取当前配置对象。"""
+    return ProviderContext(
+        config=config,
+        http_get=http_get,
+        http_post=http_post,
+        raise_if_cancelled=raise_if_cancelled,
+        sleep_with_cancel=sleep_with_cancel,
+        cancelled_error=RegistrationCancelled,
     )
-    resp.raise_for_status()
-    data = resp.json()
-    if isinstance(data, dict):
-        if data.get("token"):
-            return data.get("token")
-        if isinstance(data.get("data"), dict) and data["data"].get("token"):
-            return data["data"].get("token")
-    return None
 
 
-def cloudflare_get_messages(api_base, token):
-    headers = {"Authorization": f"Bearer {token}"}
-    path = get_cloudflare_path("cloudflare_path_messages", "/messages")
-    params = {"limit": 20, "offset": 0}
-    params = cloudflare_apply_auth_params(params)
-    resp = http_get(f"{api_base}{path}", headers=headers, params=params)
-    resp.raise_for_status()
-    try:
-        data = resp.json()
-    except Exception:
-        raise Exception(f"Cloudflare messages 返回非JSON: {resp.text[:300]}")
-    return _pick_list_payload(data)
-
-
-def cloudflare_get_message_detail(api_base, token, message_id):
-    headers = {"Authorization": f"Bearer {token}"}
-    candidates = [
-        f"{api_base}/api/mail/{message_id}",
-        f"{api_base}{get_cloudflare_path('cloudflare_path_messages', '/messages')}/{message_id}",
-    ]
-    last_err = None
-    for url in candidates:
-        try:
-            resp = http_get(
-                url,
-                headers=headers,
-                params=cloudflare_apply_auth_params(),
-            )
-            resp.raise_for_status()
-            data = resp.json()
-            if isinstance(data, dict) and isinstance(data.get("data"), dict):
-                return data["data"]
-            return data
-        except Exception as exc:
-            last_err = exc
-            continue
-    raise Exception(f"Cloudflare 获取邮件详情失败: {last_err}")
-
-
-YYDS_API_BASE = "https://maliapi.215.im/v1"
-
-
-def get_yyds_api_key():
-    return config.get("yyds_api_key", "")
-
-
-def get_yyds_jwt():
-    return config.get("yyds_jwt", "")
-
-
-def yyds_get_domains(api_key=None, jwt=None):
-    key = api_key or get_yyds_api_key()
-    token = jwt or get_yyds_jwt()
-    headers = {}
-    if token:
-        headers["Authorization"] = f"Bearer {token}"
-    elif key:
-        headers["X-API-Key"] = key
-    resp = http_get(f"{YYDS_API_BASE}/domains", headers=headers)
-    resp.raise_for_status()
-    data = resp.json()
-    return data.get("data", []) if data.get("success") else []
-
-
-def yyds_create_account(address=None, domain=None, api_key=None, jwt=None):
-    key = api_key or get_yyds_api_key()
-    token = jwt or get_yyds_jwt()
-    headers = {"Content-Type": "application/json"}
-    if token:
-        headers["Authorization"] = f"Bearer {token}"
-    elif key:
-        headers["X-API-Key"] = key
-    payload = {}
-    if address:
-        payload["address"] = address
-    if domain:
-        payload["domain"] = domain
-    elif key or token:
-        payload["autoDomainStrategy"] = "prefer_owned"
-    resp = http_post(f"{YYDS_API_BASE}/accounts", json=payload, headers=headers)
-    resp.raise_for_status()
-    data = resp.json()
-    if data.get("success"):
-        return data.get("data", {})
-    raise Exception(f"YYDS 鍒涘缓閭澶辫触: {data}")
-
-
-def yyds_get_token(address, api_key=None, jwt=None):
-    key = api_key or get_yyds_api_key()
-    token = jwt or get_yyds_jwt()
-    headers = {"Content-Type": "application/json"}
-    if token:
-        headers["Authorization"] = f"Bearer {token}"
-    elif key:
-        headers["X-API-Key"] = key
-    resp = http_post(
-        f"{YYDS_API_BASE}/token", json={"address": address}, headers=headers
-    )
-    resp.raise_for_status()
-    data = resp.json()
-    if data.get("success"):
-        return data.get("data", {}).get("token")
-    raise Exception(f"YYDS 鑾峰彇token澶辫触: {data}")
-
-
-def yyds_get_messages(address, token=None, api_key=None, jwt=None):
-    key = api_key or get_yyds_api_key()
-    temp_token = token or jwt or get_yyds_jwt()
-    headers = {}
-    if temp_token:
-        headers["Authorization"] = f"Bearer {temp_token}"
-    elif key:
-        headers["X-API-Key"] = key
-    resp = http_get(
-        f"{YYDS_API_BASE}/messages",
-        params={"address": address},
-        headers=headers,
-    )
-    resp.raise_for_status()
-    data = resp.json()
-    if data.get("success"):
-        return data.get("data", {}).get("messages", [])
-    return []
-
-
-def yyds_get_message_detail(message_id, token=None, api_key=None, jwt=None):
-    key = api_key or get_yyds_api_key()
-    temp_token = token or jwt or get_yyds_jwt()
-    headers = {}
-    if temp_token:
-        headers["Authorization"] = f"Bearer {temp_token}"
-    elif key:
-        headers["X-API-Key"] = key
-    resp = http_get(f"{YYDS_API_BASE}/messages/{message_id}", headers=headers)
-    resp.raise_for_status()
-    data = resp.json()
-    if data.get("success"):
-        return data.get("data", {})
-    raise Exception(f"YYDS 鑾峰彇閭欢璇︽儏澶辫触: {data}")
-
-
-def yyds_generate_username(length=10):
-    chars = string.ascii_lowercase + string.digits
-    return "".join(secrets.choice(chars) for _ in range(length))
-
-
-def yyds_pick_domain(api_key=None, jwt=None):
-    domains = yyds_get_domains(api_key=api_key, jwt=jwt)
-    if not domains:
-        raise Exception("YYDS 娌℃湁杩斿洖浠讳綍鍙敤鍩熷悕")
-    private = [d for d in domains if d.get("isVerified") and not d.get("isPublic")]
-    if private:
-        return private[0]["domain"]
-    public = [d for d in domains if d.get("isVerified") and d.get("isPublic")]
-    if public:
-        return public[0]["domain"]
-    verified = [d for d in domains if d.get("isVerified")]
-    if verified:
-        return verified[0]["domain"]
-    raise Exception("YYDS 鏃犲凡楠岃瘉鍩熷悕鍙敤")
-
-
-def yyds_get_email_and_token(api_key=None, jwt=None):
-    key = api_key or get_yyds_api_key()
-    token = jwt or get_yyds_jwt()
-    if not token and not key:
-        raise Exception("YYDS API Key 或 JWT 未配置")
-    domain = yyds_pick_domain(api_key=key, jwt=token)
-    username = yyds_generate_username(10)
-    result = yyds_create_account(
-        address=username, domain=domain, api_key=key, jwt=token
-    )
-    address = result.get("address") or f"{username}@{domain}"
-    temp_token = result.get("token")
-    if not temp_token:
-        temp_token = yyds_get_token(address, api_key=key, jwt=token)
-    if not temp_token:
-        raise Exception("鑾峰彇 YYDS token 澶辫触")
-    print(f"[*] 宸插垱寤?YYDS 閭: {address}")
-    return address, temp_token
-
-
-def yyds_get_oai_code(
-    token,
-    address,
-    timeout=180,
-    poll_interval=3,
-    log_callback=None,
-    jwt=None,
-    cancel_callback=None,
-):
-    deadline = time.time() + timeout
-    seen_ids = set()
-    while time.time() < deadline:
-        raise_if_cancelled(cancel_callback)
-        try:
-            messages = yyds_get_messages(address, token=token, jwt=jwt)
-        except Exception as exc:
-            if log_callback:
-                log_callback(f"[Debug] YYDS 鎷夊彇閭欢鍒楄〃澶辫触: {exc}")
-            sleep_with_cancel(poll_interval, cancel_callback)
-            continue
-        for msg in messages:
-            msg_id = msg.get("id")
-            if not msg_id or msg_id in seen_ids:
-                continue
-            seen_ids.add(msg_id)
-            to_addrs = [t.get("address", "").lower() for t in (msg.get("to") or [])]
-            if address.lower() not in to_addrs:
-                continue
-            try:
-                detail = yyds_get_message_detail(msg_id, token=token, jwt=jwt)
-            except Exception as exc:
-                if log_callback:
-                    log_callback(f"[Debug] YYDS 鑾峰彇閭欢璇︽儏澶辫触: {exc}")
-                continue
-            parts = []
-            text_body = detail.get("text") or ""
-            if text_body:
-                parts.append(text_body)
-            html_list = detail.get("html") or []
-            for h in html_list:
-                parts.append(re.sub(r"<[^>]+>", " ", h))
-            combined = "\n".join(parts)
-            subject = detail.get("subject", "")
-            if log_callback:
-                log_callback(f"[Debug] YYDS 鏀跺埌閭欢: {subject}")
-            code = extract_verification_code(combined, subject)
-            if code:
-                if log_callback:
-                    log_callback(f"[*] YYDS 浠庨偖浠朵腑鎻愬彇鍒伴獙璇佺爜: {code}")
-                return code
-        sleep_with_cancel(poll_interval, cancel_callback)
-    raise Exception(f"YYDS 在 {timeout}s 内未收到验证码邮件")
-
-
-# ── freemail provider ──────────────────────────────────────────────────────
-
-def freemail_build_headers():
-    """构建 freemail API 请求头。"""
-    jwt = str(config.get("freemail_jwt", "") or "").strip()
-    headers = {"Content-Type": "application/json"}
-    if jwt:
-        headers["Authorization"] = f"Bearer {jwt}"
-    return headers
-
-
-def freemail_get_domains():
-    """获取 freemail 可用域名列表。"""
-    api_base = str(config.get("freemail_api_base", "") or "").rstrip("/")
-    if not api_base:
-        raise Exception("freemail_api_base 未配置")
-    url = f"{api_base}/api/domains"
-    resp = http_get(url, headers=freemail_build_headers())
-    resp.raise_for_status()
-    return resp.json()
-
-
-def freemail_generate(length=None, domain_index=None):
-    """随机生成 freemail 临时邮箱，返回 (email, None)。"""
-    api_base = str(config.get("freemail_api_base", "") or "").rstrip("/")
-    if not api_base:
-        raise Exception("freemail_api_base 未配置")
-    url = f"{api_base}/api/generate"
-    params = {}
-    if length is not None:
-        params["length"] = length
-    if domain_index is not None:
-        params["domainIndex"] = domain_index
-    resp = http_get(url, headers=freemail_build_headers(), params=params)
-    resp.raise_for_status()
-    data = resp.json()
-    email = data.get("email")
-    if not email:
-        raise Exception(f"freemail /api/generate 返回数据缺少 email: {data}")
-    return email, None
-
-
-def freemail_get_emails(address, limit=50):
-    """获取指定邮箱的邮件列表。"""
-    api_base = str(config.get("freemail_api_base", "") or "").rstrip("/")
-    if not api_base:
-        raise Exception("freemail_api_base 未配置")
-    url = f"{api_base}/api/emails"
-    params = {"mailbox": address, "limit": limit}
-    resp = http_get(url, headers=freemail_build_headers(), params=params)
-    resp.raise_for_status()
-    return resp.json()
-
-
-def freemail_get_email_detail(email_id):
-    """获取单封邮件详情。"""
-    api_base = str(config.get("freemail_api_base", "") or "").rstrip("/")
-    if not api_base:
-        raise Exception("freemail_api_base 未配置")
-    url = f"{api_base}/api/email/{email_id}"
-    resp = http_get(url, headers=freemail_build_headers())
-    resp.raise_for_status()
-    return resp.json()
-
-
-def freemail_get_oai_code(
-    dev_token,
-    email,
-    timeout=180,
-    poll_interval=3,
-    log_callback=None,
-    cancel_callback=None,
-    resend_callback=None,
-):
-    """轮询 freemail 收件箱获取验证码。"""
-    deadline = time.time() + timeout
-    seen_ids = set()
-    while time.time() < deadline:
-        raise_if_cancelled(cancel_callback)
-        try:
-            messages = freemail_get_emails(email)
-        except Exception as exc:
-            if log_callback:
-                log_callback(f"[Debug] freemail 拉取邮件列表失败: {exc}")
-            sleep_with_cancel(poll_interval, cancel_callback)
-            continue
-        if not isinstance(messages, list):
-            messages = []
-        for msg in messages:
-            msg_id = msg.get("id")
-            if not msg_id or msg_id in seen_ids:
-                continue
-            seen_ids.add(msg_id)
-            # freemail 自动提取 verification_code
-            code = msg.get("verification_code")
-            subject = msg.get("subject", "")
-            if code:
-                if log_callback:
-                    log_callback(f"[*] freemail 自动提取验证码: {code}")
-                return str(code)
-            # 回退：获取详情手动解析
-            try:
-                detail = freemail_get_email_detail(msg_id)
-            except Exception as exc:
-                if log_callback:
-                    log_callback(f"[Debug] freemail 获取邮件详情失败: {exc}")
-                continue
-            code = detail.get("verification_code")
-            if code:
-                if log_callback:
-                    log_callback(f"[*] freemail 从详情提取验证码: {code}")
-                return str(code)
-            # 最后回退：手动解析内容
-            parts = []
-            if detail.get("content"):
-                parts.append(detail["content"])
-            if detail.get("html_content"):
-                parts.append(re.sub(r"<[^>]+>", " ", detail["html_content"]))
-            combined = "\n".join(parts)
-            if log_callback:
-                log_callback(f"[Debug] freemail 收到邮件: {subject}")
-            code = extract_verification_code(combined, subject)
-            if code:
-                if log_callback:
-                    log_callback(f"[*] freemail 手动解析验证码: {code}")
-                return code
-        sleep_with_cancel(poll_interval, cancel_callback)
-    raise Exception(f"freemail 在 {timeout}s 内未收到验证码邮件")
-
-
-def generate_username(length=10):
-    chars = string.ascii_lowercase + string.digits
-    return "".join(secrets.choice(chars) for _ in range(length))
-
-
-def pick_domain(api_key=None):
-    domains = get_domains(api_key=api_key)
-    if not domains:
-        raise Exception("DuckMail 娌℃湁杩斿洖浠讳綍鍙敤鍩熷悕")
-    private = [d for d in domains if d.get("ownerId")]
-    verified_private = [d for d in private if d.get("isVerified")]
-    if verified_private:
-        return verified_private[0]["domain"]
-    public = [d for d in domains if d.get("isVerified")]
-    if public:
-        return public[0]["domain"]
-    raise Exception("DuckMail 鏃犲凡楠岃瘉鍩熷悕鍙敤")
+def create_accounts_output_file(timestamp=None):
+    """返回本次注册的账号输出文件，并确保输出目录存在。"""
+    os.makedirs(ACCOUNTS_OUTPUT_DIR, exist_ok=True)
+    stamp = timestamp or datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+    return os.path.join(ACCOUNTS_OUTPUT_DIR, f"accounts_{stamp}.txt")
 
 
 def get_email_provider():
     return config.get("email_provider", "duckmail")
 
 
-def get_email_and_token(api_key=None):
+def get_gptmail_provider():
+    global gptmail_provider
+    if gptmail_provider is None:
+        gptmail_provider = GPTMailProvider(get_provider_context, lambda: browser)
+    return gptmail_provider
+
+
+def get_email_and_token(api_key=None, log_callback=None, cancel_callback=None):
     provider = get_email_provider()
+    ctx = get_provider_context()
     if provider == "yyds":
-        return yyds_get_email_and_token(api_key=api_key, jwt=get_yyds_jwt())
+        return yyds.get_email_and_token(
+            ctx,
+            api_key=api_key,
+            jwt=ctx.config.get("yyds_jwt", ""),
+        )
     if provider == "cloudflare":
-        api_base = get_cloudflare_api_base()
-        if not api_base:
-            raise Exception("Cloudflare API Base 未配置")
-        try:
-            # cloudflare_temp_email 专用模式
-            return cloudflare_create_temp_address(api_base)
-        except Exception as primary_exc:
-            # 兜底回退到 Mail.tm 风格
-            key = api_key or get_cloudflare_api_key()
-            domains = cloudflare_get_domains(api_base, api_key=key)
-            if not domains:
-                raise Exception(f"Cloudflare 创建邮箱失败: {primary_exc}")
-            verified = [d for d in domains if d.get("isVerified")]
-            target = verified[0] if verified else domains[0]
-            domain = target.get("domain")
-            if not domain:
-                raise Exception("Cloudflare 域名数据格式错误，缺少 domain 字段")
-            username = generate_username(10)
-            address = f"{username}@{domain}"
-            password = secrets.token_urlsafe(12)
-            cloudflare_create_account(
-                api_base, address, password, api_key=key, expires_in=0
-            )
-            token = cloudflare_get_token(api_base, address, password, api_key=key)
-            if not token:
-                raise Exception("获取 Cloudflare 邮箱 token 失败")
-            return address, token
+        return cloudflare.get_email_and_token(ctx)
     if provider == "freemail":
-        api_base = str(config.get("freemail_api_base", "") or "").rstrip("/")
-        if not api_base:
-            raise Exception("freemail_api_base 未配置")
-        return freemail_generate()
-    key = api_key or get_duckmail_api_key()
-    domain = pick_domain(api_key=key)
-    username = generate_username(10)
-    address = f"{username}@{domain}"
-    password = secrets.token_urlsafe(12)
-    create_account(address, password, api_key=key, expires_in=0)
-    token = get_token(address, password)
-    if not token:
-        raise Exception("鑾峰彇 DuckMail token 澶辫触")
-    return address, token
+        return freemail.get_email_and_token(ctx)
+    if provider == "mailtm":
+        return mailtm.get_email_and_token(ctx)
+    if provider == "gptmail":
+        return get_gptmail_provider().get_email_and_token(
+            log_callback=log_callback,
+            cancel_callback=cancel_callback,
+        )
+    return duckmail.get_email_and_token(ctx, api_key=api_key)
 
 
 def get_oai_code(
@@ -1580,18 +1006,21 @@ def get_oai_code(
     resend_callback=None,
 ):
     provider = get_email_provider()
+    ctx = get_provider_context()
     if provider == "yyds":
-        return yyds_get_oai_code(
+        return yyds.get_oai_code(
+            ctx,
             dev_token,
             email,
             timeout=timeout,
             poll_interval=poll_interval,
             log_callback=log_callback,
-            jwt=get_yyds_jwt(),
             cancel_callback=cancel_callback,
+            jwt=ctx.config.get("yyds_jwt", ""),
         )
     if provider == "cloudflare":
-        return cloudflare_get_oai_code(
+        return cloudflare.get_oai_code(
+            ctx,
             dev_token,
             email,
             timeout=timeout,
@@ -1601,7 +1030,8 @@ def get_oai_code(
             resend_callback=resend_callback,
         )
     if provider == "freemail":
-        return freemail_get_oai_code(
+        return freemail.get_oai_code(
+            ctx,
             dev_token,
             email,
             timeout=timeout,
@@ -1610,7 +1040,29 @@ def get_oai_code(
             cancel_callback=cancel_callback,
             resend_callback=resend_callback,
         )
-    return duckmail_get_oai_code(
+    if provider == "mailtm":
+        return mailtm.get_oai_code(
+            ctx,
+            dev_token,
+            email,
+            timeout=timeout,
+            poll_interval=poll_interval,
+            log_callback=log_callback,
+            cancel_callback=cancel_callback,
+            resend_callback=resend_callback,
+        )
+    if provider == "gptmail":
+        return get_gptmail_provider().get_oai_code(
+            dev_token,
+            email,
+            timeout=timeout,
+            poll_interval=poll_interval,
+            log_callback=log_callback,
+            cancel_callback=cancel_callback,
+            resend_callback=resend_callback,
+        )
+    return duckmail.get_oai_code(
+        ctx,
         dev_token,
         email,
         timeout=timeout,
@@ -1618,178 +1070,6 @@ def get_oai_code(
         log_callback=log_callback,
         cancel_callback=cancel_callback,
     )
-
-
-def extract_verification_code(text, subject=""):
-    if subject:
-        match = re.search(r"^([A-Z0-9]{3}-[A-Z0-9]{3})\s+xAI", subject, re.IGNORECASE)
-        if match:
-            return match.group(1)
-    match = re.search(r"\b([A-Z0-9]{3}-[A-Z0-9]{3})\b", text, re.IGNORECASE)
-    if match:
-        return match.group(1)
-    patterns = [
-        r"verification\s+code[:\s]+(\d{4,8})",
-        r"your\s+code[:\s]+(\d{4,8})",
-        r"confirm(?:ation)?\s+code[:\s]+(\d{4,8})",
-    ]
-    for pattern in patterns:
-        match = re.search(pattern, text, re.IGNORECASE)
-        if match:
-            return match.group(1)
-    return None
-
-
-def duckmail_get_oai_code(
-    dev_token,
-    email,
-    timeout=180,
-    poll_interval=3,
-    log_callback=None,
-    cancel_callback=None,
-):
-    deadline = time.time() + timeout
-    seen_ids = set()
-    while time.time() < deadline:
-        raise_if_cancelled(cancel_callback)
-        try:
-            messages = get_messages(dev_token)
-        except Exception as exc:
-            if log_callback:
-                log_callback(f"[Debug] 鎷夊彇閭欢鍒楄〃澶辫触: {exc}")
-            sleep_with_cancel(poll_interval, cancel_callback)
-            continue
-        for msg in messages:
-            msg_id = msg.get("id") or msg.get("msgid")
-            if not msg_id or msg_id in seen_ids:
-                continue
-            seen_ids.add(msg_id)
-            recipients = [t.get("address", "").lower() for t in (msg.get("to") or [])]
-            if email.lower() not in recipients:
-                continue
-            try:
-                detail = get_message_detail(dev_token, msg_id)
-            except Exception as exc:
-                if log_callback:
-                    log_callback(f"[Debug] 鑾峰彇閭欢璇︽儏澶辫触: {exc}")
-                continue
-            parts = []
-            text_body = detail.get("text") or ""
-            if text_body:
-                parts.append(text_body)
-            html_list = detail.get("html") or []
-            for h in html_list:
-                parts.append(re.sub(r"<[^>]+>", " ", h))
-            combined = "\n".join(parts)
-            subject = detail.get("subject", "")
-            if log_callback:
-                log_callback(f"[Debug] 鏀跺埌閭欢: {subject}")
-            code = extract_verification_code(combined, subject)
-            if code:
-                if log_callback:
-                    log_callback(f"[*] 浠庨偖浠朵腑鎻愬彇鍒伴獙璇佺爜: {code}")
-                return code
-        sleep_with_cancel(poll_interval, cancel_callback)
-    raise Exception(f"在 {timeout}s 内未收到验证码邮件")
-
-
-def cloudflare_get_oai_code(
-    dev_token,
-    email,
-    timeout=180,
-    poll_interval=3,
-    log_callback=None,
-    cancel_callback=None,
-    resend_callback=None,
-):
-    api_base = get_cloudflare_api_base()
-    if not api_base:
-        raise Exception("Cloudflare API Base 未配置")
-    deadline = time.time() + timeout
-    # 同一封邮件正文可能延迟可读，允许多次重试解析，避免偶发漏码
-    seen_attempts = {}
-    next_resend_at = time.time() + 35
-    while time.time() < deadline:
-        raise_if_cancelled(cancel_callback)
-        if resend_callback and time.time() >= next_resend_at:
-            try:
-                resend_callback()
-                if log_callback:
-                    log_callback("[*] 已触发重新发送验证码")
-            except Exception as exc:
-                if log_callback:
-                    log_callback(f"[Debug] 触发重发验证码失败: {exc}")
-            next_resend_at = time.time() + 35
-        try:
-            messages = cloudflare_get_messages(api_base, dev_token)
-        except Exception as exc:
-            if log_callback:
-                log_callback(f"[Debug] Cloudflare 拉取邮件列表失败: {exc}")
-            sleep_with_cancel(poll_interval, cancel_callback)
-            continue
-        if log_callback:
-            log_callback(f"[Debug] Cloudflare 本轮邮件数量: {len(messages)}")
-
-        for msg in messages:
-            msg_id = msg.get("id") or msg.get("msgid")
-            if not msg_id:
-                continue
-            attempt = int(seen_attempts.get(msg_id, 0))
-            if attempt >= 5:
-                continue
-            seen_attempts[msg_id] = attempt + 1
-            recipients = [t.get("address", "").lower() for t in (msg.get("to") or [])]
-            msg_addr = str(msg.get("address", "")).lower()
-            # 优先匹配目标邮箱；若结构不一致也允许继续解析，避免接口字段漂移导致漏码
-            address_matched = True
-            if recipients:
-                address_matched = email.lower() in recipients
-            elif msg_addr:
-                address_matched = msg_addr == email.lower()
-            if not address_matched and log_callback:
-                log_callback(f"[Debug] 跳过疑似非目标邮件 id={msg_id} address={msg_addr} to={recipients}")
-                continue
-            parts = []
-            # 先直接从列表项取内容，避免 detail 接口差异导致漏码
-            for field in ("text", "raw", "content", "intro", "body", "snippet"):
-                value = msg.get(field)
-                if isinstance(value, str) and value.strip():
-                    parts.append(value)
-            html_list = msg.get("html") or []
-            if isinstance(html_list, str):
-                html_list = [html_list]
-            for h in html_list:
-                parts.append(re.sub(r"<[^>]+>", " ", h))
-            subject = str(msg.get("subject", "") or "")
-            combined = "\n".join(parts)
-            # 再尝试 detail 接口补全内容
-            try:
-                detail = cloudflare_get_message_detail(api_base, dev_token, msg_id)
-                for field in ("text", "raw", "content", "intro", "body", "snippet"):
-                    value = detail.get(field)
-                    if isinstance(value, str) and value.strip():
-                        combined += "\n" + value
-                html_list2 = detail.get("html") or []
-                if isinstance(html_list2, str):
-                    html_list2 = [html_list2]
-                for h in html_list2:
-                    combined += "\n" + re.sub(r"<[^>]+>", " ", h)
-                if not subject:
-                    subject = str(detail.get("subject", "") or "")
-            except Exception as exc:
-                if log_callback:
-                    log_callback(f"[Debug] Cloudflare detail接口失败，改用列表内容解析: {exc}")
-            if log_callback:
-                log_callback(f"[Debug] Cloudflare 收到邮件: {subject}")
-            code = extract_verification_code(combined, subject)
-            if code:
-                if log_callback:
-                    log_callback(f"[*] Cloudflare 从邮件中提取到验证码: {code}")
-                return code
-            elif log_callback:
-                log_callback(f"[Debug] 邮件已解析但未提取到验证码 id={msg_id} attempt={seen_attempts[msg_id]}")
-        sleep_with_cancel(poll_interval, cancel_callback)
-    raise Exception(f"Cloudflare 在 {timeout}s 内未收到验证码邮件")
 
 
 def generate_random_birthdate():
@@ -1963,6 +1243,8 @@ SIGNUP_URL = "https://accounts.x.ai/sign-up?redirect=grok-com"
 
 browser = None
 page = None
+grok_tab = None
+gptmail_provider = None
 browser_proxy_bridge = None
 browser_started_with_proxy = False
 
@@ -2069,7 +1351,8 @@ def tk_option_menu(parent, variable, values, width=12):
 
 
 def start_browser(log_callback=None, use_proxy=True):
-    global browser, page, browser_proxy_bridge, browser_started_with_proxy
+    global browser, page, grok_tab, gptmail_provider
+    global browser_proxy_bridge, browser_started_with_proxy
     last_exc = None
     proxy_enabled = bool(use_proxy and get_configured_proxy())
     for attempt in range(1, 5):
@@ -2080,7 +1363,10 @@ def start_browser(log_callback=None, use_proxy=True):
             browser_proxy_bridge = bridge
             browser_started_with_proxy = bool(browser_proxy)
             tabs = browser.get_tabs()
-            page = tabs[-1] if tabs else browser.new_tab()
+            grok_tab = tabs[-1] if tabs else browser.new_tab()
+            page = grok_tab
+            if gptmail_provider is not None:
+                gptmail_provider.reset()
             if log_callback and getattr(browser, "user_data_path", None):
                 log_callback(f"[Debug] 当前浏览器资料目录: {browser.user_data_path}")
             if log_callback and get_configured_proxy():
@@ -2106,6 +1392,9 @@ def start_browser(log_callback=None, use_proxy=True):
                 pass
             browser = None
             page = None
+            grok_tab = None
+            if gptmail_provider is not None:
+                gptmail_provider.reset()
             browser_proxy_bridge = None
             browser_started_with_proxy = False
             time.sleep(min(1.5 * attempt, 4))
@@ -2113,15 +1402,19 @@ def start_browser(log_callback=None, use_proxy=True):
 
 
 def stop_browser():
-    global browser, page, browser_started_with_proxy
+    global browser, page, grok_tab, gptmail_provider
+    global browser_started_with_proxy
     if browser is not None:
         try:
             browser.quit(del_data=True)
         except Exception:
             pass
     stop_browser_proxy_bridge()
+    if gptmail_provider is not None:
+        gptmail_provider.reset()
     browser = None
     page = None
+    grok_tab = None
     browser_started_with_proxy = False
 
 
@@ -2140,15 +1433,16 @@ def cleanup_runtime_memory(log_callback=None, reason="定期清理"):
 
 
 def refresh_active_page():
-    global browser, page
+    global browser, page, grok_tab
     if browser is None:
         restart_browser()
     try:
-        tabs = browser.get_tabs()
-        if tabs:
-            page = tabs[-1]
-        else:
-            page = browser.new_tab()
+        if grok_tab is None:
+            tabs = browser.get_tabs()
+            grok_tab = tabs[-1] if tabs else browser.new_tab()
+        # GPTMail 是独立 tab；page 永远恢复到 Grok tab。
+        page = grok_tab
+        _ = page.url
     except Exception:
         restart_browser()
     return page
@@ -2223,7 +1517,7 @@ return candidates[0].text || true;
 
 
 def open_signup_page(log_callback=None, cancel_callback=None):
-    global browser, page
+    global browser, page, grok_tab
     raise_if_cancelled(cancel_callback)
     if browser is None:
         start_browser(log_callback=log_callback)
@@ -2231,14 +1525,18 @@ def open_signup_page(log_callback=None, cancel_callback=None):
             log_callback("[*] 浏览器已启动")
 
     def _open_with_current_browser():
-        global page
+        global page, grok_tab
         try:
-            page = browser.get_tab(0)
+            if grok_tab is None:
+                tabs = browser.get_tabs()
+                grok_tab = tabs[-1] if tabs else browser.new_tab()
+            page = grok_tab
             page.get(SIGNUP_URL)
         except Exception as e:
             if log_callback:
                 log_callback(f"[Debug] 打开URL异常: {e}")
             page = browser.new_tab(SIGNUP_URL)
+            grok_tab = page
         page.wait.doc_loaded()
 
     try:
@@ -2283,9 +1581,98 @@ return !!(givenInput && familyInput && passwordInput);
         return False
 
 
+def wait_for_email_submission_result(timeout=15, log_callback=None, cancel_callback=None):
+    """等待 X/Grok 明确进入验证码页面，避免只因点击按钮就继续流程。"""
+    deadline = time.time() + timeout
+    last_state = None
+    while time.time() < deadline:
+        raise_if_cancelled(cancel_callback)
+        state = page.run_js(
+            r"""
+function isVisible(node) {
+    if (!node) return false;
+    const style = window.getComputedStyle(node);
+    if (style.display === 'none' || style.visibility === 'hidden' || style.opacity === '0') return false;
+    const rect = node.getBoundingClientRect();
+    return rect.width > 0 && rect.height > 0;
+}
+function textOf(node) {
+    return [
+        node && node.innerText,
+        node && node.textContent,
+        node && node.getAttribute && node.getAttribute('aria-label'),
+        node && node.getAttribute && node.getAttribute('title'),
+    ].filter(Boolean).join(' ').replace(/\s+/g, ' ').trim();
+}
+function visibleText(selector, limit) {
+    return Array.from(document.querySelectorAll(selector))
+        .filter(isVisible)
+        .map(textOf)
+        .filter(Boolean)
+        .slice(0, limit || 20);
+}
+const emailInputs = Array.from(document.querySelectorAll(
+    'input[type="email"], input[name*="email" i], input[autocomplete="email"], input[placeholder*="mail" i], input[aria-label*="mail" i], input[placeholder*="邮箱"], input[aria-label*="邮箱"]'
+)).filter((node) => isVisible(node) && !node.disabled && !node.readOnly);
+const codeInputs = Array.from(document.querySelectorAll(
+    'input[autocomplete="one-time-code"], input[name*="code" i], input[id*="code" i], input[placeholder*="code" i], input[aria-label*="code" i], input[placeholder*="验证码"], input[aria-label*="验证码"], input[data-input-otp="true"]'
+)).filter((node) => isVisible(node) && !node.disabled && !node.readOnly);
+const alerts = visibleText('[role="alert"], [aria-live="assertive"], [aria-live="polite"], [data-testid*="error" i], [class*="error" i], [class*="invalid" i]', 30);
+const bodyText = String((document.body && document.body.innerText) || '').replace(/\s+/g, ' ').trim();
+const nearby = emailInputs.flatMap((input) => {
+    const values = [];
+    let node = input;
+    for (let i = 0; i < 3 && node; i += 1, node = node.parentElement) {
+        const text = textOf(node);
+        if (text) values.push(text.slice(0, 500));
+    }
+    return values;
+});
+const rejectionPattern = /email\s+(?:address\s+)?(?:is\s+)?(?:not\s+)?(?:available|valid|supported|accepted|allowed|usable)|(?:not\s+available|not\s+accepted|cannot\s+use|can't\s+use|invalid\s+email|different\s+email|disposable\s+email|temporary\s+email|email.*(?:unavailable|unsupported|already.*(?:used|registered|associated)|in\s+use|taken))|邮箱.{0,30}(?:不可用|无效|不支持|不能|无法|不接受|被拒绝|暂不可用|已被使用|已注册|占用)|(?:不可用|无效|不支持|不能|无法|不接受).{0,30}邮箱/i;
+const errorText = [...alerts, ...nearby, bodyText].find((text) => rejectionPattern.test(text)) || '';
+if (errorText) {
+    return {state: 'rejected', error: errorText.slice(0, 500), url: location.href, title: document.title};
+}
+const verificationText = /verification\s+(?:code|email)|enter\s+(?:the\s+)?code|check\s+(?:your\s+)?email|验证码|验证邮件|确认邮件/i.test(bodyText);
+if (codeInputs.length || (verificationText && !emailInputs.length)) {
+    return {state: 'verification', code_inputs: codeInputs.length, url: location.href, title: document.title};
+}
+return {
+    state: 'pending',
+    email_inputs: emailInputs.length,
+    code_inputs: codeInputs.length,
+    url: location.href,
+    title: document.title,
+    text: bodyText.slice(0, 300),
+};
+            """
+        )
+        if isinstance(state, dict):
+            last_state = state
+            if state.get("state") == "rejected":
+                detail = state.get("error") or "页面明确拒绝当前邮箱"
+                raise EmailSubmissionFailed(f"邮箱被 X/Grok 拒绝或不可用: {detail}")
+            if state.get("state") == "verification":
+                return state
+        sleep_with_cancel(0.5, cancel_callback)
+
+    detail = ""
+    if isinstance(last_state, dict):
+        detail = (
+            f" url={last_state.get('url', '')};"
+            f" email_inputs={last_state.get('email_inputs', 0)};"
+            f" code_inputs={last_state.get('code_inputs', 0)};"
+            f" text={last_state.get('text', '')}"
+        )
+    raise EmailSubmissionFailed(f"邮箱提交后未确认进入验证码页面（{timeout}s）{detail}")
+
+
 def fill_email_and_submit(timeout=45, log_callback=None, cancel_callback=None):
     raise_if_cancelled(cancel_callback)
-    email, dev_token = get_email_and_token()
+    email, dev_token = get_email_and_token(
+        log_callback=log_callback,
+        cancel_callback=cancel_callback,
+    )
     if not email or not dev_token:
         raise Exception("获取邮箱失败")
     if log_callback:
@@ -2530,7 +1917,18 @@ return 'enter';
         if clicked:
             if log_callback:
                 detail = f" ({clicked})" if isinstance(clicked, str) else ""
-                log_callback(f"[*] 已填写邮箱并提交: {email}{detail}")
+                log_callback(f"[*] 已填写邮箱并发起提交: {email}{detail}")
+            remaining = max(2, min(15, deadline - time.time()))
+            result = wait_for_email_submission_result(
+                timeout=remaining,
+                log_callback=log_callback,
+                cancel_callback=cancel_callback,
+            )
+            if log_callback:
+                result_url = result.get("url", "") if isinstance(result, dict) else ""
+                log_callback(
+                    f"[*] X/Grok 已确认进入验证码步骤: {result_url}"
+                )
             return email, dev_token
         sleep_with_cancel(0.5, cancel_callback)
     if last_snapshot:
@@ -2543,7 +1941,22 @@ return 'enter';
     raise Exception("未找到邮箱输入框或注册按钮")
 
 
-def fill_code_and_submit(email, dev_token, timeout=180, log_callback=None, cancel_callback=None):
+def normalize_manual_verification_code(value):
+    raw = str(value or "").strip()
+    parsed = extract_verification_code(raw)
+    if parsed:
+        return normalize_verification_code(parsed)
+    return normalize_verification_code(raw)
+
+
+def fill_code_and_submit(
+    email,
+    dev_token,
+    timeout=180,
+    log_callback=None,
+    cancel_callback=None,
+    manual_code_callback=None,
+):
     def _resend_code():
         page.run_js(
             r"""
@@ -2557,16 +1970,34 @@ return false;
             """
         )
 
-    code = get_oai_code(
-        dev_token,
-        email,
-        log_callback=log_callback,
-        cancel_callback=cancel_callback,
-        resend_callback=_resend_code,
-    )
+    try:
+        code = get_oai_code(
+            dev_token,
+            email,
+            log_callback=log_callback,
+            cancel_callback=cancel_callback,
+            resend_callback=_resend_code,
+        )
+    except RegistrationCancelled:
+        raise
+    except Exception as exc:
+        message = str(exc)
+        if not manual_code_callback:
+            raise
+        if log_callback:
+            log_callback("[!] 自动提取验证码失败，保留当前页面，等待人工输入验证码")
+        manual_value = manual_code_callback(email, message)
+        code = normalize_manual_verification_code(manual_value)
+        if not code:
+            raise_if_cancelled(cancel_callback)
+            raise Exception("人工输入验证码为空或格式无效") from exc
+        if log_callback:
+            log_callback(f"[*] 使用人工输入验证码继续: {code}")
     if not code:
         raise Exception("获取验证码失败")
-    clean_code = str(code).replace("-", "").strip()
+    clean_code = normalize_verification_code(code)
+    if not clean_code:
+        raise Exception("验证码格式无效：只能包含 4-12 位字母或数字")
     deadline = time.time() + timeout
 
     while time.time() < deadline:
@@ -3182,8 +2613,13 @@ class GrokRegisterGUI:
         self.results = []
         self.stop_requested = False
         self.ui_queue = queue.Queue()
+        self.manual_code_requests = queue.Queue()
+        self.manual_code_request = None
+        self.manual_code_var = tk.StringVar()
+        self.manual_code_status_var = tk.StringVar(value="")
         self.accounts_output_file = ""
         self.setup_ui()
+        self.root.after(200, self._poll_manual_code_request)
 
     def setup_ui(self):
         load_config()
@@ -3227,7 +2663,7 @@ class GrokRegisterGUI:
 
         add_label(0, 0, "邮箱服务商:")
         self.email_provider_var = tk.StringVar(value=config.get("email_provider", "duckmail"))
-        self.email_provider_combo = tk_option_menu(config_frame, self.email_provider_var, ["duckmail", "yyds", "cloudflare", "freemail"], width=12)
+        self.email_provider_combo = tk_option_menu(config_frame, self.email_provider_var, ["duckmail", "yyds", "cloudflare", "freemail", "mailtm", "gptmail"], width=12)
         add_field(self.email_provider_combo, 0, 1, sticky=tk.W)
 
         add_label(0, 2, "注册数量:")
@@ -3336,20 +2772,25 @@ class GrokRegisterGUI:
         self.freemail_jwt_entry = tk_entry(config_frame, textvariable=self.freemail_jwt_var, width=72)
         add_field(self.freemail_jwt_entry, 11, 1, columnspan=3)
 
-        add_label(12, 0, "CLIProxyAPI 上传:")
+        add_label(12, 0, "GPTMail URL:")
+        self.gptmail_url_var = tk.StringVar(value=str(config.get("gptmail_url", "https://mail.chatgpt.org.uk/")))
+        self.gptmail_url_entry = tk_entry(config_frame, textvariable=self.gptmail_url_var, width=72)
+        add_field(self.gptmail_url_entry, 12, 1, columnspan=3)
+
+        add_label(13, 0, "CLIProxyAPI 上传:")
         self.cliproxyapi_auto_var = tk.BooleanVar(value=bool(config.get("cliproxyapi_auto_add", False)))
         self.cliproxyapi_auto_check = tk_checkbutton(config_frame, variable=self.cliproxyapi_auto_var)
-        add_field(self.cliproxyapi_auto_check, 12, 1, sticky=tk.W)
+        add_field(self.cliproxyapi_auto_check, 13, 1, sticky=tk.W)
 
-        add_label(13, 0, "CLIProxyAPI Base:")
+        add_label(14, 0, "CLIProxyAPI Base:")
         self.cliproxyapi_base_var = tk.StringVar(value=str(config.get("cliproxyapi_remote_base", "")))
         self.cliproxyapi_base_entry = tk_entry(config_frame, textvariable=self.cliproxyapi_base_var, width=72)
-        add_field(self.cliproxyapi_base_entry, 13, 1, columnspan=3)
+        add_field(self.cliproxyapi_base_entry, 14, 1, columnspan=3)
 
-        add_label(14, 0, "CLIProxyAPI Key:")
+        add_label(15, 0, "CLIProxyAPI Key:")
         self.cliproxyapi_key_var = tk.StringVar(value=str(config.get("cliproxyapi_management_key", "")))
         self.cliproxyapi_key_entry = tk_entry(config_frame, textvariable=self.cliproxyapi_key_var, width=72)
-        add_field(self.cliproxyapi_key_entry, 14, 1, columnspan=3)
+        add_field(self.cliproxyapi_key_entry, 15, 1, columnspan=3)
 
         btn_frame = tk.Frame(main_frame, bg=UI_BG)
         btn_frame.grid(row=1, column=0, sticky=tk.EW, pady=(0, 6))
@@ -3359,6 +2800,15 @@ class GrokRegisterGUI:
         self.stop_btn.pack(side=tk.LEFT, padx=5)
         self.clear_btn = tk_button(btn_frame, text="清空日志", command=self.clear_log)
         self.clear_btn.pack(side=tk.LEFT, padx=5)
+        self.manual_code_entry = tk_entry(btn_frame, textvariable=self.manual_code_var, width=16, state=tk.DISABLED)
+        self.manual_code_entry.pack(side=tk.LEFT, padx=(18, 4))
+        self.manual_code_btn = tk_button(
+            btn_frame,
+            text="提交人工验证码",
+            command=self.submit_manual_code,
+            state=tk.DISABLED,
+        )
+        self.manual_code_btn.pack(side=tk.LEFT, padx=4)
 
         status_frame = tk.Frame(main_frame, bg=UI_BG)
         status_frame.grid(row=2, column=0, sticky=tk.EW, pady=(0, 6))
@@ -3366,6 +2816,14 @@ class GrokRegisterGUI:
         tk_label(status_frame, text="状态: ").pack(side=tk.LEFT)
         self.status_label = tk.Label(status_frame, textvariable=self.status_var, bg=UI_BG, fg="green")
         self.status_label.pack(side=tk.LEFT)
+        self.manual_code_status_label = tk.Label(
+            status_frame,
+            textvariable=self.manual_code_status_var,
+            bg=UI_BG,
+            fg="#e6b450",
+            anchor=tk.W,
+        )
+        self.manual_code_status_label.pack(side=tk.LEFT, padx=(16, 0))
         self.stats_var = tk.StringVar(value="成功: 0 | 失败: 0")
         tk.Label(status_frame, textvariable=self.stats_var, bg=UI_BG, fg=UI_FG).pack(side=tk.RIGHT)
         log_frame = tk.LabelFrame(
@@ -3409,6 +2867,78 @@ class GrokRegisterGUI:
     def clear_log(self):
         self.log_text.delete(1.0, tk.END)
 
+    def request_manual_code(self, email, reason):
+        """在后台注册线程中等待 GUI 提交人工验证码，保持 Tk 主线程不被阻塞。"""
+        request = {
+            "email": str(email or ""),
+            "reason": str(reason or ""),
+            "event": threading.Event(),
+            "code": None,
+            "cancelled": False,
+        }
+        self.manual_code_requests.put(request)
+        while not request["event"].wait(0.2):
+            if self.should_stop():
+                request["cancelled"] = True
+                request["event"].set()
+                return None
+        if request.get("cancelled"):
+            return None
+        return request.get("code")
+
+    def _poll_manual_code_request(self):
+        """由 Tk 主线程轮询人工验证码请求，避免工作线程直接操作控件。"""
+        try:
+            current = self.manual_code_request
+            if current is not None and current["event"].is_set():
+                self._deactivate_manual_code()
+
+            if self.manual_code_request is None:
+                while True:
+                    try:
+                        request = self.manual_code_requests.get_nowait()
+                    except queue.Empty:
+                        break
+                    if request.get("cancelled") or request["event"].is_set():
+                        continue
+                    self.manual_code_request = request
+                    self.manual_code_var.set("")
+                    reason = request.get("reason", "")
+                    if len(reason) > 90:
+                        reason = reason[:90] + "..."
+                    self.manual_code_status_var.set(
+                        f"{request.get('email', '')} 等待人工验证码"
+                        + (f"（{reason}）" if reason else "")
+                    )
+                    self.manual_code_entry.config(state=tk.NORMAL)
+                    self.manual_code_btn.config(state=tk.NORMAL)
+                    self.manual_code_entry.focus_set()
+                    break
+            self.root.after(200, self._poll_manual_code_request)
+        except tk.TclError:
+            # 窗口关闭时不再重新调度。
+            return
+
+    def _deactivate_manual_code(self):
+        self.manual_code_entry.config(state=tk.DISABLED)
+        self.manual_code_btn.config(state=tk.DISABLED)
+        self.manual_code_status_var.set("")
+        self.manual_code_request = None
+
+    def submit_manual_code(self):
+        request = self.manual_code_request
+        if request is None:
+            self.log("[!] 当前没有等待人工验证码的注册流程")
+            return
+        code = normalize_manual_verification_code(self.manual_code_var.get())
+        if not code:
+            self.log("[!] 人工验证码格式无效，请输入 4-12 位字母/数字验证码")
+            return
+        request["code"] = code
+        request["event"].set()
+        self._deactivate_manual_code()
+        self.log(f"[*] 已提交人工验证码: {code}")
+
     def update_stats(self):
         self.stats_var.set(f"成功: {self.success_count} | 失败: {self.fail_count}")
 
@@ -3442,6 +2972,7 @@ class GrokRegisterGUI:
         config["grok2api_remote_app_key"] = self.grok2api_remote_key_var.get().strip()
         config["freemail_api_base"] = self.freemail_api_base_var.get().strip()
         config["freemail_jwt"] = self.freemail_jwt_var.get().strip()
+        config["gptmail_url"] = self.gptmail_url_var.get().strip() or "https://mail.chatgpt.org.uk/"
         config["cliproxyapi_auto_add"] = bool(self.cliproxyapi_auto_var.get())
         config["cliproxyapi_remote_base"] = self.cliproxyapi_base_var.get().strip()
         config["cliproxyapi_management_key"] = self.cliproxyapi_key_var.get().strip()
@@ -3458,6 +2989,8 @@ class GrokRegisterGUI:
         if config["email_provider"] == "freemail" and not config["freemail_api_base"]:
             self.log("[!] freemail 模式需要先填写 freemail API Base")
             return
+        if config["email_provider"] == "gptmail":
+            self.log(f"[*] GPTMail 使用浏览器模式: {config['gptmail_url']}")
         try:
             count = int(self.count_var.get())
         except Exception:
@@ -3469,10 +3002,7 @@ class GrokRegisterGUI:
         self.success_count = 0
         self.fail_count = 0
         self.results = []
-        now = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
-        self.accounts_output_file = os.path.join(
-            os.path.dirname(__file__), f"accounts_{now}.txt"
-        )
+        self.accounts_output_file = create_accounts_output_file()
         self.update_stats()
         self._set_running_ui(True)
         self.log(f"[*] 配置已保存，开始执行。目标数量: {count}")
@@ -3485,6 +3015,10 @@ class GrokRegisterGUI:
 
     def stop_registration(self):
         self.stop_requested = True
+        request = self.manual_code_request
+        if request is not None:
+            request["cancelled"] = True
+            request["event"].set()
         self.log("[!] 用户停止注册")
 
     def run_registration(self, count):
@@ -3510,20 +3044,36 @@ class GrokRegisterGUI:
                             log_callback=self.log, cancel_callback=self.should_stop
                         )
                         self.log("[*] 2. 创建邮箱并提交")
-                        email, dev_token = fill_email_and_submit(
-                            log_callback=self.log, cancel_callback=self.should_stop
-                        )
+                        try:
+                            email, dev_token = fill_email_and_submit(
+                                log_callback=self.log, cancel_callback=self.should_stop
+                            )
+                        except EmailSubmissionFailed as mail_exc:
+                            if mail_try < max_mail_retry:
+                                self.log(
+                                    f"[!] 当前邮箱未通过 X/Grok 可用性校验，保留浏览器并刷新注册页换邮箱: {mail_exc}"
+                                )
+                                # 拒绝发生在邮箱步骤，Grok tab 通常仍可复用；下一轮
+                                # open_signup_page() 会在同一个 tab 重新打开注册页，
+                                # get_email_and_token() 再创建一个新邮箱即可。
+                                refresh_active_page()
+                                sleep_with_cancel(0.3, self.should_stop)
+                                continue
+                            raise
                         self.log(f"[*] 邮箱: {email}")
                         self.log(f"[Debug] 邮箱credential(jwt): {dev_token}")
-                        try:
-                            with open(
-                                os.path.join(os.path.dirname(__file__), "mail_credentials.txt"),
-                                "a",
-                                encoding="utf-8",
-                            ) as f:
-                                f.write(f"{email}\t{dev_token}\n")
-                        except Exception:
-                            pass
+                        if get_email_provider() != "gptmail":
+                            try:
+                                with open(
+                                    os.path.join(os.path.dirname(__file__), "mail_credentials.txt"),
+                                    "a",
+                                    encoding="utf-8",
+                                ) as f:
+                                    f.write(f"{email}\t{dev_token}\n")
+                            except Exception:
+                                pass
+                        else:
+                            self.log("[Debug] GPTMail 使用浏览器收件箱，不保存占位 token")
                         self.log("[*] 3. 拉取验证码")
                         try:
                             code = fill_code_and_submit(
@@ -3531,6 +3081,7 @@ class GrokRegisterGUI:
                                 dev_token,
                                 log_callback=self.log,
                                 cancel_callback=self.should_stop,
+                                manual_code_callback=self.request_manual_code,
                             )
                             mail_ok = True
                             break
@@ -3640,16 +3191,32 @@ def cli_log(message):
     print(f"[{timestamp}] {message}", flush=True)
 
 
+def request_manual_code_cli(email, reason, cancel_callback=None):
+    cli_log(f"[!] 自动提取验证码失败: {reason}")
+    cli_log(f"[!] 请在邮箱页面查看 {email} 的邮件，直接粘贴验证码。回车则放弃当前邮箱并重试。")
+    while not (cancel_callback and cancel_callback()):
+        try:
+            value = input("manual code> ").strip()
+        except EOFError:
+            return None
+        except KeyboardInterrupt:
+            raise RegistrationCancelled("用户停止注册")
+        if not value:
+            return None
+        code = normalize_manual_verification_code(value)
+        if code:
+            return code
+        cli_log("[!] 验证码格式无效，请输入 4-12 位字母/数字验证码，或直接回车换邮箱")
+    raise RegistrationCancelled("用户停止注册")
+
+
 def run_registration_cli(count):
     controller = CliStopController()
     success_count = 0
     fail_count = 0
     retry_count_for_slot = 0
     max_slot_retry = 3
-    accounts_output_file = os.path.join(
-        os.path.dirname(__file__),
-        f"accounts_{datetime.datetime.now().strftime('%Y%m%d_%H%M%S')}.txt",
-    )
+    accounts_output_file = create_accounts_output_file()
     cli_log(f"[*] 终端模式启动，目标数量: {count}")
     cli_log(f"[*] 成功账号将实时保存到: {accounts_output_file}")
     try:
@@ -3672,20 +3239,33 @@ def run_registration_cli(count):
                         log_callback=cli_log, cancel_callback=controller.should_stop
                     )
                     cli_log("[*] 2. 创建邮箱并提交")
-                    email, dev_token = fill_email_and_submit(
-                        log_callback=cli_log, cancel_callback=controller.should_stop
-                    )
+                    try:
+                        email, dev_token = fill_email_and_submit(
+                            log_callback=cli_log, cancel_callback=controller.should_stop
+                        )
+                    except EmailSubmissionFailed as mail_exc:
+                        if mail_try < max_mail_retry:
+                            cli_log(
+                                f"[!] 当前邮箱未通过 X/Grok 可用性校验，保留浏览器并刷新注册页换邮箱: {mail_exc}"
+                            )
+                            refresh_active_page()
+                            sleep_with_cancel(0.3, controller.should_stop)
+                            continue
+                        raise
                     cli_log(f"[*] 邮箱: {email}")
                     cli_log(f"[Debug] 邮箱credential(jwt): {dev_token}")
-                    try:
-                        with open(
-                            os.path.join(os.path.dirname(__file__), "mail_credentials.txt"),
-                            "a",
-                            encoding="utf-8",
-                        ) as f:
-                            f.write(f"{email}\t{dev_token}\n")
-                    except Exception:
-                        pass
+                    if get_email_provider() != "gptmail":
+                        try:
+                            with open(
+                                os.path.join(os.path.dirname(__file__), "mail_credentials.txt"),
+                                "a",
+                                encoding="utf-8",
+                            ) as f:
+                                f.write(f"{email}\t{dev_token}\n")
+                        except Exception:
+                            pass
+                    else:
+                        cli_log("[Debug] GPTMail 使用浏览器收件箱，不保存占位 token")
                     cli_log("[*] 3. 拉取验证码")
                     try:
                         code = fill_code_and_submit(
@@ -3693,6 +3273,9 @@ def run_registration_cli(count):
                             dev_token,
                             log_callback=cli_log,
                             cancel_callback=controller.should_stop,
+                            manual_code_callback=lambda current_email, reason: request_manual_code_cli(
+                                current_email, reason, cancel_callback=controller.should_stop
+                            ),
                         )
                         mail_ok = True
                         break

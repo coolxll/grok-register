@@ -9,6 +9,8 @@
   "cloudflare_path_messages": "/api/mails",
   "freemail_api_base": "",
   "freemail_jwt": "",
+  "mailtm_api_base": "https://api.mail.tm",
+  "gptmail_url": "https://mail.chatgpt.org.uk/",
   "proxy": "",
   "enable_nsfw": true,
   "register_count": 1,

@@ -49,9 +49,9 @@ Grok Register 是一个面向自动化流程研究、测试环境验证和个人
 - 支持 GUI 图形界面运行。
 - 支持 CLI 终端运行，不启动 Tk GUI。
 - 注册流程使用 Chromium/Chrome 浏览器页面完成。
-- 支持 DuckMail、YYDS、Cloudflare 临时邮箱接口。
+- 支持 DuckMail、YYDS、Cloudflare、freemail、mail.tm 临时邮箱接口，以及 GPTMail 浏览器收件箱。
 - 支持验证码邮件轮询和解析。
-- 支持成功账号实时写入 `accounts_*.txt`。
+- 支持成功账号实时写入 `accounts/accounts_*.txt`。
 - 支持将 SSO token 写入 grok2api 本地或远端池。
 - 支持注册后尝试开启 NSFW。
 - 支持页面卡住检测、当前账号重试、浏览器重启和内存清理。
@@ -91,7 +91,7 @@ cp config.example.json config.json
 
 | 配置项 | 说明 |
 | --- | --- |
-| `email_provider` | 邮箱服务商：`duckmail`、`yyds`、`cloudflare`、`freemail` |
+| `email_provider` | 邮箱服务商：`duckmail`、`yyds`、`cloudflare`、`freemail`、`mailtm`、`gptmail` |
 | `register_count` | 本次目标注册数量 |
 | `proxy` | 代理地址，可留空 |
 | `enable_nsfw` | 注册后是否尝试开启 NSFW |
@@ -105,6 +105,8 @@ cp config.example.json config.json
 | `defaultDomains` | Cloudflare 临时邮箱默认域名 |
 | `freemail_api_base` | freemail 临时邮箱 API 地址 |
 | `freemail_jwt` | freemail JWT Token（用于 API 认证） |
+| `mailtm_api_base` | mail.tm 临时邮箱 API 地址，默认 `https://api.mail.tm` |
+| `gptmail_url` | GPTMail 页面地址，默认 `https://mail.chatgpt.org.uk/` |
 | `grok2api_auto_add_local` | 是否写入本地 grok2api token 池 |
 | `grok2api_local_token_file` | 本地 grok2api token 文件路径 |
 | `grok2api_auto_add_remote` | 是否写入远端 grok2api |
@@ -201,6 +203,41 @@ python cf_mail_debug.py --api-base "https://你的-worker-api-域名" --auth-mod
 
 认证方式：使用 freemail 环境变量中的 `JWT_TOKEN`，通过 `Authorization: Bearer` 头传递。
 
+### mail.tm 临时邮箱
+
+[mail.tm](https://mail.tm) 是免费的临时邮箱服务，无需自建，直接使用官方 API。
+
+```json
+{
+  "email_provider": "mailtm",
+  "mailtm_api_base": "https://api.mail.tm"
+}
+```
+
+特点：
+- 无需 API Key 或 JWT，完全免费
+- 自动创建临时账号并获取 token
+- 支持自定义 API 地址（如使用自建实例）
+
+### GPTMail 浏览器邮箱
+
+[GPTMail](https://mail.chatgpt.org.uk/) 当前集成使用浏览器页面生成邮箱并读取收件箱，不需要在配置中填写 token。
+
+```json
+{
+  "email_provider": "gptmail",
+  "gptmail_url": "https://mail.chatgpt.org.uk/"
+}
+```
+
+GPTMail 会在注册过程中保持第二个浏览器 tab 打开，验证码阶段自动刷新收件箱，先锁定 Grok/xAI 邮件，再从目标邮件候选和详情中解析验证码。该模式返回的是浏览器 provider 占位 token，不会写入 `mail_credentials.txt`。
+
+验证码读取会先综合发件人、主题、摘要和正文中的 Grok/xAI/X 品牌及验证语义；DuckMail、YYDS、Cloudflare、freemail、mail.tm 也复用同一套目标邮件筛选。多封邮件无法明确区分时会继续轮询并等待人工介入，不会直接解析第一封。
+
+邮箱提交后，程序会等待 X/Grok 明确进入验证码页面；如果页面提示邮箱不可用、无效或不支持，会保留当前浏览器和 Grok tab，只刷新注册页并更换邮箱重试。自动提取验证码超时后，GUI 会启用“提交人工验证码”输入框，CLI 会提示粘贴验证码；直接回车则放弃当前邮箱并进入重试。
+
+GPTMail 也提供 API 文档，但 API Key 需要另行申请；当前实现不使用 API，默认使用浏览器模式。
+
 ### CLIProxyAPI 凭证上传
 
 注册成功后可将 SSO token 自动上传到 [CLIProxyAPI](https://github.com/router-for-me/CLIProxyAPI) 作为 xAI auth 文件：
@@ -253,7 +290,7 @@ GUI 模式会打开 Tkinter 窗口，适合手动调整配置和观察日志。
 
 运行过程中会生成：
 
-- `accounts_*.txt`：成功账号、密码和 SSO token。
+- `accounts/accounts_*.txt`：成功账号、密码和 SSO token。
 - `mail_credentials.txt`：临时邮箱凭证。
 - `*.log`：可选日志文件。
 
@@ -265,7 +302,8 @@ GUI 模式会打开 Tkinter 窗口，适合手动调整配置和观察日志。
 - 每成功 5 个账号执行一次内存清理。
 - CLI 模式支持 `Ctrl+C` 中断并清理浏览器。
 - 最终页长时间无变化时自动重试当前账号。
-- 验证码未收到时自动更换邮箱重试。
+- 邮箱提交后必须确认进入验证码步骤；被 X/Grok 拒绝的邮箱会自动更换。
+- 验证码自动提取失败时保留当前页面，GUI/CLI 支持人工粘贴验证码后继续。
 
 ## 常见问题
 
@@ -286,7 +324,10 @@ GUI 数量控件可能有上限。CLI 模式直接读取 `config.json` 中的 `r
 ```text
 .
 ├── grok_register_ttk.py   # 主程序
+├── providers/              # 独立邮箱 provider 实现
+├── accounts/               # 成功账号输出目录
 ├── cf_mail_debug.py       # Cloudflare 邮箱调试工具
+├── GPTMAIL_INTEGRATION_PLAN.md # GPTMail 探索与集成计划
 ├── config.example.json    # 配置示例
 ├── requirements.txt       # Python 依赖
 └── README.md
